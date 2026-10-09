@@ -26,7 +26,7 @@ from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
 from PIL import Image
 
 from utils import ascii_label
-from boundary_agent import BoundaryAgent, draw_intelligent_boundary
+from boundary_agent import draw_geojson_outline
 
 matplotlib.rcParams.update({"font.family": "DejaVu Sans"})
 
@@ -227,6 +227,88 @@ def fetch_basemap_tile(lon_min: float, lon_max: float, lat_min: float, lat_max: 
     return None
 
 
+# ====================== MAP SCALE BAR / COMPOSITE LEGEND ======================
+
+def _nice_length_km(target_km: float) -> float:
+    """Largest 1/2/5 x 10^n length that does not exceed target_km."""
+    mag = 10 ** np.floor(np.log10(max(target_km, 1e-3)))
+    for m in (5, 2, 1):
+        if m * mag <= target_km:
+            return float(m * mag)
+    return float(mag)
+
+
+def _fmt_distance(km: float) -> str:
+    if km < 1:
+        return f"{km * 1000:g} m"
+    return f"{km:g} km"
+
+
+def _draw_map_scale_bar(map_ax, lon_min, lon_max, lat_min, lat_max):
+    """
+    Draw a scale bar in the lower-left corner of the map, in map coordinates,
+    so its drawn length is the ground distance it is labelled with
+    (measured east-west at the map's middle latitude).
+    """
+    width_deg  = lon_max - lon_min
+    height_deg = lat_max - lat_min
+    lat_mid    = (lat_min + lat_max) / 2.0
+    km_per_deg = 111.32 * max(np.cos(np.radians(lat_mid)), 1e-6)
+
+    length_km  = _nice_length_km(width_deg * km_per_deg * 0.25)
+    length_deg = length_km / km_per_deg
+
+    x0    = lon_min + 0.04 * width_deg
+    y0    = lat_min + 0.04 * height_deg
+    bar_h = 0.012 * height_deg
+    pc    = ccrs.PlateCarree()
+
+    # White backing so the bar stays readable over any imagery
+    map_ax.add_patch(mpatches.Rectangle(
+        (x0 - 0.02 * width_deg, y0 - 0.015 * height_deg),
+        length_deg + 0.10 * width_deg, bar_h + 0.065 * height_deg,
+        facecolor="white", edgecolor="#94a3b8", lw=0.5, alpha=0.85,
+        transform=pc, zorder=8))
+
+    half = length_deg / 2.0
+    for i, face in enumerate(("#111827", "white")):
+        map_ax.add_patch(mpatches.Rectangle(
+            (x0 + i * half, y0), half, bar_h,
+            facecolor=face, edgecolor="#111827", lw=0.6,
+            transform=pc, zorder=9))
+
+    y_text = y0 + bar_h + 0.008 * height_deg
+    for x, label in ((x0, "0"),
+                     (x0 + half, f"{length_km / 2:g}"),
+                     (x0 + length_deg, _fmt_distance(length_km))):
+        map_ax.text(x, y_text, label, ha="center", va="bottom", fontsize=7,
+                    color=_TEXT_DARK, transform=pc, zorder=9)
+
+
+_CHANNEL_BAND_NAMES = {
+    "R": "Red", "G": "Green", "B": "Blue", "N": "Near infrared",
+    "S1": "Shortwave infrared 1", "S2": "Shortwave infrared 2",
+    "VV": "VV backscatter", "VH": "VH backscatter", "VVdVH": "VV / VH ratio",
+}
+
+
+def _draw_composite_legend(ap, bands):
+    """Legend for 3-band colour composites: which band is shown in each colour channel."""
+    ap.text(0.5, 0.34, "Colour composite", ha='center', va='center', fontsize=8,
+            weight='bold', color=_TEXT_DARK, transform=ap.transAxes)
+    channels = [("Red", "#d64545"), ("Green", "#3f9d4b"), ("Blue", "#3f6fd1")]
+    for i, (channel, colour) in enumerate(channels):
+        y_row = 0.27 - i * 0.055
+        ap.add_patch(mpatches.Rectangle(
+            (0.10, y_row - 0.016), 0.08, 0.032,
+            facecolor=colour, edgecolor="#333", lw=0.5,
+            transform=ap.transAxes, zorder=5))
+        band = bands[i] if i < len(bands) else channel
+        ap.text(0.22, y_row, _CHANNEL_BAND_NAMES.get(band, str(band)),
+                ha='left', va='center', fontsize=7,
+                color=_TEXT_DARK, transform=ap.transAxes)
+
+
 def _compute_layout_params(geo_bounds: dict | None) -> dict:
     """
     Compute figure dimensions and subplot sizes based on region aspect ratio.
@@ -278,6 +360,7 @@ def render_cartographic_figure(
     region_geom=None,
     uploaded_geojson=None,
     custom_title: str | None = None,
+    boundary_geojson=None,
 ):
 
     import textwrap
@@ -373,78 +456,25 @@ def render_cartographic_figure(
     gl.yformatter = LATITUDE_FORMATTER
 
     # -------------------------
-    # INTELLIGENT BOUNDARY DETECTION & DRAWING
-    # Agent automatically detects: Country (ADM0), Province (ADM1), District (ADM2)
-    # Uses geoBoundaries: WM/geoLab/geoBoundaries/600/ADM{0,1,2}
-    # -------------------------
-    
-    # Auto-detect administrative level from region name
-    admin_level, admin_type = BoundaryAgent.detect_admin_level(region_name)
-    
-    print(f"🗺️  Region: '{region_name}' → {admin_type} (ADM{admin_level})")
-    
-    if not uploaded_geojson:
-        # No custom AOI: Draw the region's official boundary
-        success = draw_intelligent_boundary(
-            map_ax=map_ax,
-            region_name=region_name,
-            country_name="Sri Lanka",
-            admin_level=admin_level,
-            custom_geojson=None
-        )
-        
-        if not success:
-            print(f"⚠️  Could not fetch boundary for '{region_name}' - map will display without boundary")
-    
-    # -------------------------
-    # CUSTOM AOI BOUNDARY (uploaded GeoJSON)
-    # Draw custom polygons + optional context boundary
+    # REGION BOUNDARY
+    # The outline is resolved once by the caller: either the uploaded AOI
+    # or the admin boundary that was used to clip the data.
     # -------------------------
     if uploaded_geojson:
-        print(f"📍 Custom AOI uploaded with {len(uploaded_geojson.get('features', []))} features")
-        
-        # Option 1: Draw context boundary (region boundary) - lighter style
-        # This provides geographic context for the custom AOI
-        try:
-            success = draw_intelligent_boundary(
-                map_ax=map_ax,
-                region_name=region_name,
-                country_name="Sri Lanka",
-                admin_level=admin_level,
-                custom_geojson=None
-            )
-            if success:
-                print(f"✅ Context boundary added: {admin_type} ({region_name})")
-        except Exception as e:
-            print(f"⚠️  Could not add context boundary: {e}")
-        
-        # Option 2: Draw the custom AOI polygons on top - bold black
-        try:
-            from shapely.geometry import shape
+        draw_geojson_outline(map_ax, uploaded_geojson, color="black", linewidth=2.0)
+    elif boundary_geojson:
+        draw_geojson_outline(map_ax, boundary_geojson, color=_TEXT_DARK, linewidth=1.5)
 
-            if uploaded_geojson["type"] == "FeatureCollection":
-                geoms = [shape(f["geometry"]) for f in uploaded_geojson["features"]]
-            else:
-                geoms = [shape(uploaded_geojson)]
-
-            for geom in geoms:
-                if hasattr(geom, 'exterior'):
-                    x, y = geom.exterior.xy
-                    map_ax.plot(x, y,
-                            color="black",
-                            linewidth=2.5,  # Bold for custom AOI
-                            transform=ccrs.PlateCarree(),
-                            zorder=7,  # On top of context boundary
-                            label="Custom AOI")
-            
-            print(f"✅ Custom AOI polygons drawn on top")
-        except Exception as e:
-            print(f"⚠️  Custom AOI draw error: {e}")
+    # -------------------------
+    # SCALE BAR (on the map, so its length matches the map's scale)
+    # -------------------------
+    if geo_bounds:
+        _draw_map_scale_bar(map_ax, lon_min, lon_max, lat_min, lat_max)
 
     map_ax.set_title("")  # remove matplotlib default
 
     # -------------------------
-    # PANEL  match map axes position exactly
+    # PANEL
     # -------------------------
     ap.axis('off')
     ap.set_facecolor("#ffffff")
@@ -456,28 +486,7 @@ def render_cartographic_figure(
         transform=ap.transAxes
     ))
 
-    # -------------------------
-    # INTELLIGENT PANEL LAYOUT (AI-driven spacing)
-    # -------------------------
-    # Calculate optimal spacing based on available height
-    panel_height = 1.0
-    reserved_for_legend = 0.40  # 40% for legend/colorbar
-    reserved_for_title = 0.08   # 8% for panel title
-    remaining_space = panel_height - reserved_for_legend - reserved_for_title  # ~52%
-    
-    # Distribute remaining space among elements
-    arrow_height = remaining_space * 0.15  # 15% of remaining = ~8%
-    arrow_spacing = remaining_space * 0.10 # spacing after arrow = ~5%
-    scale_height = remaining_space * 0.25  # 25% of remaining = ~13%
-    scale_spacing = remaining_space * 0.08 # spacing after scale = ~4%
-    # Rest goes to padding and breathing room
-
     y = 0.96
-
-    def next_y(h):
-        nonlocal y
-        y -= h
-        return y
 
     # -------------------------
     # TITLE IN PANEL (Small, clean)
@@ -486,21 +495,20 @@ def render_cartographic_figure(
     ap.text(0.5, y - 0.03, title_clean,
             ha='center', fontsize=10, weight='bold', color=_TEXT_DARK,
             transform=ap.transAxes)
-    y -= reserved_for_title
+    y -= 0.08
 
     # -------------------------
-    # NORTH ARROW - Optimally sized
+    # NORTH ARROW
     # -------------------------
-    yn = next_y(arrow_height)
+    arrow_height = 0.08
+    y -= arrow_height
 
-    # N label
-    ap.text(0.5, yn + arrow_height * 0.5, "N",
-            ha='center', fontsize=8, weight='bold', color=_TEXT_DARK,
+    ap.text(0.5, y + arrow_height * 0.6 + 0.032, "N",
+            ha='center', va='bottom', fontsize=8, weight='bold', color=_TEXT_DARK,
             transform=ap.transAxes)
 
-    # Arrow - proportional
     ap.add_patch(mpatches.FancyArrow(
-        0.5, yn,
+        0.5, y,
         0, arrow_height * 0.6,
         width=0.004,
         head_width=0.025,
@@ -509,85 +517,54 @@ def render_cartographic_figure(
         transform=ap.transAxes,
         zorder=5
     ))
-    
-    # Breathing room after arrow
-    y -= arrow_spacing
+
+    y -= 0.05
 
     # -------------------------
-    # SCALE BAR - Optimally sized
+    # LEGEND  (fully inside panel box)
     # -------------------------
-    ys = next_y(scale_height)
-
-    km_ticks, _ = _dynamic_scale_ticks(geo_bounds)
-
-    total_w = 0.60
-    x_start = 0.20
-    bar_h   = scale_height * 0.35  # Proportional to scale section height
-    seg_w   = total_w / (len(km_ticks) - 1)
-
-    # "km" label above bar
-    ap.text(0.5, ys + bar_h + 0.012, "km",
-            ha='center', va='bottom', fontsize=7, weight='bold', color=_TEXT_DARK,
-            transform=ap.transAxes)
-
-    # Scale bar segments
-    for i in range(len(km_ticks) - 1):
-        x0 = x_start + i * seg_w
-        color = "#111827" if i % 2 == 0 else "#e5e7eb"
-        ap.add_patch(mpatches.Rectangle(
-            (x0, ys - bar_h), seg_w, bar_h,
-            facecolor=color, edgecolor="#111827", lw=0.5,
-            transform=ap.transAxes, zorder=4
-        ))
-
-    # Tick labels BELOW the bar
-    for i, km in enumerate(km_ticks):
-        xf = x_start + i * seg_w
-        ap.text(xf, ys - bar_h - 0.015, str(km),
-                ha='center', va='top', fontsize=6.5, color=_TEXT_DARK,
-                transform=ap.transAxes)
-
-    # Breathing room after scale (no divider line - removed!)
-    y -= scale_spacing
-
-    # -------------------------
-    # LEGEND  (fully inside panel box) - FIXED
-    # -------------------------
-    yl = next_y(0.02)
+    palette = vis_params_gee.get("palette")
 
     if lulc_legend:
-        # LULC legend
-        y_legend = yl - 0.15
-        for item in lulc_legend:
+        # Discrete class legend; rows shrink so every class fits in the panel
+        y_top = y - 0.04
+        row_h = min(0.035, (y_top - 0.04) / max(len(lulc_legend), 1))
+        font_size = 7 if row_h >= 0.03 else 6
+        for i, item in enumerate(lulc_legend):
+            y_row = y_top - i * row_h
             ap.add_patch(mpatches.Rectangle(
-                (0.10, y_legend - 0.014), 0.08, 0.025,
+                (0.10, y_row - row_h * 0.36), 0.08, row_h * 0.72,
                 facecolor=item["color"], edgecolor="#333", lw=0.5,
                 transform=ap.transAxes, zorder=5
             ))
-            ap.text(0.22, y_legend, item["label"],
-                    ha='left', va='center', fontsize=7,
+            ap.text(0.22, y_row, item["label"],
+                    ha='left', va='center', fontsize=font_size,
                     color=_TEXT_DARK, transform=ap.transAxes)
-            y_legend -= 0.035
+
+    elif is_rgb or not palette:
+        # Colour composite: no colour ramp, so show which band drives each channel
+        _draw_composite_legend(ap, vis_params_gee.get("bands", []))
 
     else:
         # Continuous colorbar
-        cmap = LinearSegmentedColormap.from_list("custom", vis_params_gee["palette"])
+        cmap = LinearSegmentedColormap.from_list("custom", palette)
         norm = mcolors.Normalize(
             vmin=vis_params_gee.get("min", 0),
             vmax=vis_params_gee.get("max", 1)
         )
-        # Colorbar inset - FIXED: Better positioning
         cax = ap.inset_axes([0.08, 0.18, 0.84, 0.058])
         cb = mcolorbar.ColorbarBase(cax, cmap=cmap, norm=norm, orientation='horizontal')
         ticks = np.linspace(vis_params_gee.get("min", 0), vis_params_gee.get("max", 1), 5)
         cb.set_ticks(ticks)
-        cb.set_ticklabels([f"{t:.2g}" for t in ticks], fontsize=6)
+        # Whole numbers for wide ranges (totals in the thousands), else 2 significant digits
+        wide = abs(ticks[-1] - ticks[0]) >= 20
+        cb.set_ticklabels([f"{t:,.0f}" if wide else f"{t:.2g}" for t in ticks], fontsize=6)
         cb.ax.tick_params(labelsize=6, length=2, width=0.5, color=_TEXT_DARK)
         for tl in cb.ax.get_xticklabels():
             tl.set_color(_TEXT_DARK)
         cb.outline.set_linewidth(0.5)
         cb.outline.set_edgecolor(_TICK_COL)
-        
+
         # Label below colorbar
         ap.text(0.5, 0.12, display_label,
                 ha='center', va='top', fontsize=7, color=_TEXT_DARK,

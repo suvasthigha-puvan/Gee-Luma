@@ -1,60 +1,45 @@
 """
 boundary_agent.py
 -----------------
-Intelligent agent that detects administrative levels (Country, Province, District)
-from user input and fetches the appropriate geoBoundaries dataset.
+Resolves a place name to an administrative boundary from the geoBoundaries
+dataset, for any country.
 
 Uses:
-  - ADM0 (Country): WM/geoLab/geoBoundaries/600/ADM0
-  - ADM1 (Province): WM/geoLab/geoBoundaries/600/ADM1
-  - ADM2 (District): WM/geoLab/geoBoundaries/600/ADM2
+  - ADM0 (Country):          WM/geoLab/geoBoundaries/600/ADM0
+  - ADM1 (Province / State): WM/geoLab/geoBoundaries/600/ADM1
+  - ADM2 (District):         WM/geoLab/geoBoundaries/600/ADM2
+
+The admin level and parent country normally come from the LLM agent, which
+knows that "Galle" is a district of Sri Lanka. When they are missing, every
+level is tried in turn (country first) rather than guessing from the name.
 """
 
-import ee
+import difflib
 import re
-from typing import Dict, Tuple, Optional
+import unicodedata
+
+import ee
+from typing import Dict, List, Optional, Tuple
+
 
 class BoundaryAgent:
-    """
-    Intelligent agent for detecting and fetching administrative boundaries.
-    Understands user input context to determine admin level.
-    """
-    
-    # Admin level keywords and patterns
-    COUNTRY_KEYWORDS = {
-        'country', 'nation', 'whole', 'full', 'entire', 'national',
-        'worldwide', 'global', 'complete', 'all', 'end-to-end'
-    }
-    
-    PROVINCE_KEYWORDS = {
-        'province', 'state', 'region', 'territory', 'zone',
-        'administrative region', 'subdivision', 'provincial'
-    }
-    
-    DISTRICT_KEYWORDS = {
-        'district', 'county', 'municipality', 'local authority',
-        'local government', 'borough', 'commune', 'departement'
+    """Looks up administrative boundaries in geoBoundaries."""
+
+    DATASETS = {
+        0: 'WM/geoLab/geoBoundaries/600/ADM0',
+        1: 'WM/geoLab/geoBoundaries/600/ADM1',
+        2: 'WM/geoLab/geoBoundaries/600/ADM2',
     }
 
-    # Known country-province-district hierarchies
-    KNOWN_HIERARCHIES = {
-        'sri_lanka': {
-            'country': 'Sri Lanka',
-            'provinces': ['Western', 'Central', 'Southern', 'Northern', 'Eastern', 
-                         'North Western', 'North Central', 'Uva', 'Sabaragamuwa'],
-            'districts': {
-                'Northern': ['Jaffna', 'Mullaitivu', 'Vavuniya', 'Batticaloa'],
-                'Central': ['Kandy', 'Matara', 'Nuwara Eliya'],
-                'Western': ['Colombo', 'Gampaha', 'Kalutara'],
-                'Southern': ['Galle', 'Matara', 'Hambantota'],
-            }
-        }
+    LEVEL_NAMES = {0: "Country", 1: "Province / State", 2: "District"}
+
+    # Words in the region name that state the admin level explicitly.
+    # Matched as whole words only ("Galle" must not match "all").
+    _LEVEL_WORDS = {
+        0: {'country', 'nation', 'national'},
+        1: {'province', 'state', 'region', 'territory', 'provincial'},
+        2: {'district', 'county', 'municipality', 'borough', 'commune', 'departement'},
     }
-    
-    @staticmethod
-    def normalize_text(text: str) -> str:
-        """Normalize text for comparison."""
-        return text.lower().strip().replace(' ', '_')
 
     # Trailing admin-level words that geoBoundaries' shapeName field never
     # includes (it stores bare place names, e.g. "Jaffna" not "Jaffna District").
@@ -74,296 +59,250 @@ class BoundaryAgent:
         if len(words) > 1 and words[-1].lower() in BoundaryAgent._ADMIN_SUFFIXES:
             return " ".join(words[:-1])
         return region_name.strip()
-    
+
     @staticmethod
-    def detect_admin_level(region_name: str, context: Optional[Dict] = None) -> Tuple[int, str]:
+    def detect_admin_level(region_name: str) -> Tuple[Optional[int], str]:
         """
-        Detect administrative level from region name and context.
-        
-        Args:
-            region_name: Name of the region (e.g., "Sri Lanka", "Western", "Jaffna")
-            context: Optional context dict with keys like 'hierarchy', 'keywords'
-        
-        Returns:
-            Tuple of (admin_level, detected_type)
-            admin_level: 0 (Country), 1 (Province), 2 (District)
-            detected_type: String description
+        Read an explicit admin level out of the region name, if it states one.
+
+        Returns (admin_level, description). admin_level is None when the name
+        gives no hint ("Galle", "India") - callers should then try all levels.
         """
-        
-        region_lower = region_name.lower()
-        
-        # Check explicit context hints first
-        if context:
-            if 'hierarchy' in context:
-                hierarchy = context['hierarchy'].lower()
-                if 'country' in hierarchy or 'national' in hierarchy:
-                    return 0, "Country"
-                elif 'province' in hierarchy or 'state' in hierarchy:
-                    return 1, "Province"
-                elif 'district' in hierarchy or 'county' in hierarchy:
-                    return 2, "District"
-        
-        # Check region name against known keywords
-        words_in_region = set(region_lower.split())
-        
-        # Check for country-level indicators
-        if any(kw in region_lower for kw in BoundaryAgent.COUNTRY_KEYWORDS):
-            return 0, "Country"
-        
-        # Check for province-level indicators
-        if any(kw in region_lower for kw in BoundaryAgent.PROVINCE_KEYWORDS):
-            return 1, "Province"
-        
-        # Check for district-level indicators
-        if any(kw in region_lower for kw in BoundaryAgent.DISTRICT_KEYWORDS):
-            return 2, "District"
-        
-        # Check against known hierarchies (Sri Lanka example)
-        sri_lanka = BoundaryAgent.KNOWN_HIERARCHIES.get('sri_lanka', {})
-        
-        # Check if it's a known country
-        if region_name.lower() == sri_lanka.get('country', '').lower():
-            return 0, "Country"
-        
-        # Check if it's a known province
-        if region_name in sri_lanka.get('provinces', []):
-            return 1, "Province"
-        
-        # Check if it's a known district
-        for prov_districts in sri_lanka.get('districts', {}).values():
-            if region_name in prov_districts:
-                return 2, "District"
-        
-        # Default: Try to infer from capitalization and length
-        # Longer, multi-word names are usually countries
-        # Single words could be provinces or districts
-        if len(region_name.split()) > 1:
-            return 0, "Country (inferred)"
-        
-        # Single word: ambiguous - check if matches known district
-        if region_name in ['Jaffna', 'Colombo', 'Galle', 'Kandy']:
-            return 2, "District (pattern match)"
-        
-        # Default to district level for single region names
-        return 2, "District (default)"
-    
+        words = set(region_name.lower().replace(',', ' ').split())
+        for level in (2, 1, 0):
+            if words & BoundaryAgent._LEVEL_WORDS[level]:
+                return level, BoundaryAgent.LEVEL_NAMES[level]
+        return None, "Auto"
+
     @staticmethod
     def get_boundary_dataset(admin_level: int) -> str:
+        """GEE dataset path for an admin level (0, 1 or 2)."""
+        return BoundaryAgent.DATASETS.get(admin_level, BoundaryAgent.DATASETS[2])
+
+    # geoBoundaries stores names in each country's own convention
+    # ("Galle District", "Western Province", "Bayern", "Maharashtra" with
+    # diacritics), so names are compared in a normalised form: ASCII-folded,
+    # lower-case, punctuation removed, trailing admin word dropped.
+    _NORMALISE_SUFFIXES = _ADMIN_SUFFIXES | {
+        'prefecture', 'governorate', 'department', 'oblast', 'division', 'parish', 'canton',
+    }
+
+    _names_cache: Dict[Tuple[int, str], List[Tuple[str, str]]] = {}
+
+    @staticmethod
+    def _normalise(name: str) -> str:
+        text = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii")
+        text = re.sub(r"[^a-z0-9 ]", " ", text.lower())
+        words = text.split()
+        if len(words) > 1 and words[-1] in BoundaryAgent._NORMALISE_SUFFIXES:
+            words = words[:-1]
+        return " ".join(words)
+
+    @staticmethod
+    def _names(level: int, iso3: str = "") -> List[Tuple[str, str]]:
         """
-        Get the appropriate geoBoundaries dataset for the admin level.
-        
+        (shapeName, shapeGroup) pairs at an admin level - all countries for
+        level 0, one country's units for levels 1 and 2. Cached per process.
+        """
+        key = (level, iso3)
+        if key not in BoundaryAgent._names_cache:
+            col = ee.FeatureCollection(BoundaryAgent.DATASETS[level])
+            if level > 0:
+                col = col.filter(ee.Filter.eq('shapeGroup', iso3))
+            info = ee.Dictionary({
+                'names': col.aggregate_array('shapeName'),
+                'groups': col.aggregate_array('shapeGroup'),
+            }).getInfo()
+            BoundaryAgent._names_cache[key] = list(zip(info['names'], info['groups']))
+        return BoundaryAgent._names_cache[key]
+
+    @staticmethod
+    def _best_match(candidates: List[str], names: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+        """
+        Pick the (shapeName, shapeGroup) that a candidate spelling refers to:
+        exact normalised match first, then a near-identical spelling
+        (transliteration differences). Never a mere substring, so "Western"
+        cannot match "North Western".
+        """
+        by_norm: Dict[str, Tuple[str, str]] = {}
+        for pair in names:
+            by_norm.setdefault(BoundaryAgent._normalise(pair[0]), pair)
+        wanted = [BoundaryAgent._normalise(c) for c in candidates if c and str(c).strip()]
+        wanted = [w for w in wanted if w]
+        for w in wanted:
+            if w in by_norm:
+                return by_norm[w]
+        # Same words in another order ("South Korea" is stored as "Korea, South")
+        by_words = {frozenset(n.split()): pair for n, pair in by_norm.items()}
+        for w in wanted:
+            if frozenset(w.split()) in by_words:
+                return by_words[frozenset(w.split())]
+        # Some names are stored with "?" where an accented letter was lost
+        # ("Mah?r?shtra"); treat each "?" as any single letter.
+        for shape_name, group in names:
+            if "?" not in shape_name:
+                continue
+            pattern = ".".join(re.escape(part) for part in shape_name.lower().split("?"))
+            for c in candidates:
+                folded = unicodedata.normalize("NFKD", str(c)).encode("ascii", "ignore").decode("ascii")
+                if re.fullmatch(pattern + r"( \w+)?", folded.strip().lower()):
+                    return (shape_name, group)
+        for w in wanted:
+            close = difflib.get_close_matches(w, list(by_norm), n=1, cutoff=0.88)
+            if close:
+                return by_norm[close[0]]
+        return None
+
+    @staticmethod
+    def resolve(region_name: str, country_name: Optional[str] = None,
+                admin_level: Optional[int] = None, country_iso3: Optional[str] = None,
+                aliases: Optional[List[str]] = None) -> Optional[Dict]:
+        """
+        Find the boundary for a place name.
+
         Args:
-            admin_level: 0 (Country), 1 (Province), 2 (District)
-        
-        Returns:
-            GEE dataset path
+            region_name:  place to find ("Sri Lanka", "Western Province", "Galle")
+            country_name: country the place is in
+            admin_level:  0, 1 or 2 if known. Tried first; the other levels are
+                          still tried afterwards in case the hint was wrong.
+            country_iso3: ISO 3166-1 alpha-3 code of the country ("LKA"). More
+                          reliable than the name ("South Korea" is stored as
+                          "Korea, South").
+            aliases:      other spellings of the region, e.g. the local-language
+                          name ("Bayern" for "Bavaria")
+
+        Returns None if nothing matches, otherwise a dict with:
+            geometry    - ee.Geometry (server-side, not downloaded)
+            name        - matched shapeName
+            admin_level - level the match was found at
+            admin_type  - "Country" / "Province / State" / "District"
         """
-        datasets = {
-            0: 'WM/geoLab/geoBoundaries/600/ADM0',
-            1: 'WM/geoLab/geoBoundaries/600/ADM1',
-            2: 'WM/geoLab/geoBoundaries/600/ADM2'
-        }
-        return datasets.get(admin_level, datasets[2])
-    
+        if not region_name or not region_name.strip():
+            return None
+        candidates = [region_name] + [a for a in (aliases or []) if isinstance(a, str)]
+
+        def _result(level, shape_name, iso3):
+            feature = (ee.FeatureCollection(BoundaryAgent.DATASETS[level])
+                       .filter(ee.Filter.eq('shapeGroup', iso3))
+                       .filter(ee.Filter.eq('shapeName', shape_name))
+                       .first())
+            return {
+                'geometry': feature.geometry(),
+                'name': shape_name,
+                'admin_level': level,
+                'admin_type': BoundaryAgent.LEVEL_NAMES[level],
+            }
+
+        countries = BoundaryAgent._names(0)
+
+        # Which country are we in?
+        iso3 = (country_iso3 or "").strip().upper()
+        if not (len(iso3) == 3 and any(g == iso3 for _, g in countries)):
+            iso3 = ""
+            if country_name and country_name.strip():
+                match = BoundaryAgent._best_match([country_name], countries)
+                iso3 = match[1] if match else ""
+
+        if admin_level not in (0, 1, 2):
+            admin_level, _ = BoundaryAgent.detect_admin_level(region_name)
+        levels = ([admin_level] if admin_level is not None else []) + \
+                 [l for l in (0, 1, 2) if l != admin_level]
+
+        for level in levels:
+            if level == 0:
+                # The region is a country if its name is a country name, or it
+                # is the same name the agent gave as the containing country.
+                match = BoundaryAgent._best_match(candidates, countries)
+                if match is None and iso3 and country_name and \
+                        BoundaryAgent._normalise(country_name) in \
+                        {BoundaryAgent._normalise(c) for c in candidates}:
+                    match = next(pair for pair in countries if pair[1] == iso3)
+                if match:
+                    return _result(0, match[0], match[1])
+            elif iso3:
+                match = BoundaryAgent._best_match(candidates, BoundaryAgent._names(level, iso3))
+                if match:
+                    return _result(level, match[0], match[1])
+            else:
+                # Country unknown: the whole world's units cannot be listed, so
+                # ask the server for exact spellings, with and without suffix.
+                spellings = []
+                for c in candidates:
+                    core = BoundaryAgent.core_name(c)
+                    for base in (core, core.title()):
+                        for form in [base] + [f"{base} {sfx.title()}" for sfx in
+                                              ('district', 'province', 'state', 'county', 'region')]:
+                            if form not in spellings:
+                                spellings.append(form)
+                info = (ee.FeatureCollection(BoundaryAgent.DATASETS[level])
+                        .filter(ee.Filter.inList('shapeName', spellings))
+                        .limit(1).select(['shapeName', 'shapeGroup'], None, False).getInfo())
+                feats = info.get('features', [])
+                if feats:
+                    props = feats[0]['properties']
+                    return _result(level, props['shapeName'], props['shapeGroup'])
+
+        return None
+
+    @staticmethod
+    def outline_geojson(geometry: ee.Geometry, geo_bounds: Optional[Dict] = None) -> Optional[Dict]:
+        """
+        Download a boundary as GeoJSON for drawing on the map.
+
+        The outline is simplified to about 1/2000 of the region's extent, which
+        is below what is visible in print and keeps large countries small
+        enough to download.
+        """
+        try:
+            max_error_m = 100.0
+            if geo_bounds:
+                span_deg = max(geo_bounds["lon_max"] - geo_bounds["lon_min"],
+                               geo_bounds["lat_max"] - geo_bounds["lat_min"])
+                max_error_m = max(span_deg * 111_000 / 2000, 10.0)
+            return geometry.simplify(maxError=max_error_m).getInfo()
+        except Exception as e:
+            print(f"Could not download boundary outline: {e}")
+            return None
+
     @staticmethod
     def fetch_boundary(region_name: str, country_name: Optional[str] = None,
                        admin_level: Optional[int] = None) -> Optional[Dict]:
-        """
-        Fetch boundary for a region from geoBoundaries.
-        
-        Args:
-            region_name: Name of the region
-            country_name: Country name for filtering (helpful for provinces/districts)
-            admin_level: Explicit admin level (0, 1, or 2). If None, auto-detect.
-        
-        Returns:
-            GeoJSON geometry or None if not found
-        """
+        """Boundary of a region as a GeoJSON geometry dict, or None if not found."""
         try:
-            # Auto-detect admin level if not provided
-            if admin_level is None:
-                admin_level, detected_type = BoundaryAgent.detect_admin_level(region_name)
-                print(f"Detected '{region_name}' as: {detected_type} (ADM{admin_level})")
-
-            # Get appropriate dataset
-            dataset_path = BoundaryAgent.get_boundary_dataset(admin_level)
-            collection = ee.FeatureCollection(dataset_path)
-
-            # geoBoundaries' shapeName is a bare place name ("Jaffna"), so strip
-            # trailing admin words ("Jaffna District") before matching against it.
-            core = BoundaryAgent.core_name(region_name)
-
-            # Try exact match on the stripped name first, then the raw name
-            filtered = collection.filter(ee.Filter.inList('shapeName', [core, region_name]))
-
-            # If no results, try substring match both directions
-            if filtered.size().getInfo() == 0:
-                filtered = collection.filter(
-                    ee.Filter.stringContains('shapeName', core)
-                )
-
-            # If still no results and country provided, filter by country for districts/provinces
-            if filtered.size().getInfo() == 0 and country_name:
-                filtered = collection.filter(
-                    ee.Filter.eq('countryName', country_name)
-                ).filter(
-                    ee.Filter.stringContains('shapeName', core)
-                )
-
-            # Get geometry
-            if filtered.size().getInfo() > 0:
-                geometry = filtered.first().geometry()
-                return geometry.getInfo()
-
-            print(f"Warning: Could not find boundary for '{region_name}' at level ADM{admin_level}")
-            return None
-
+            found = BoundaryAgent.resolve(region_name, country_name, admin_level)
+            return found['geometry'].getInfo() if found else None
         except Exception as e:
             print(f"Error fetching boundary for '{region_name}': {e}")
             return None
-    
-    @staticmethod
-    def get_boundary_info(region_name: str, admin_level: Optional[int] = None) -> Dict:
-        """
-        Get comprehensive boundary information.
-        
-        Returns dict with:
-          - admin_level: 0, 1, or 2
-          - admin_type: "Country", "Province", or "District"
-          - dataset: GEE dataset path
-          - boundary_color: Recommended color for visualization
-        """
-        if admin_level is None:
-            admin_level, admin_type = BoundaryAgent.detect_admin_level(region_name)
-        else:
-            type_map = {0: "Country", 1: "Province", 2: "District"}
-            admin_type = type_map.get(admin_level, "Unknown")
-        
-        colors = {
-            0: "#0a0e27",      # Dark navy for country
-            1: "#1f2937",      # Dark gray for province
-            2: "#0d1b2a"       # Black for district
-        }
-        
-        line_widths = {
-            0: 2.5,  # Thicker for country
-            1: 2.0,  # Medium for province
-            2: 1.5   # Thinner for district
-        }
-        
-        return {
-            'admin_level': admin_level,
-            'admin_type': admin_type,
-            'dataset': BoundaryAgent.get_boundary_dataset(admin_level),
-            'boundary_color': colors.get(admin_level, "#000000"),
-            'line_width': line_widths.get(admin_level, 1.5),
-            'region_name': region_name
-        }
 
 
-def draw_intelligent_boundary(map_ax, region_name: str, 
-                             country_name: Optional[str] = None,
-                             admin_level: Optional[int] = None,
-                             custom_geojson: Optional[Dict] = None) -> bool:
-    """
-    Draw boundary intelligently on map based on administrative level.
-    
-    If custom_geojson is provided, it takes precedence.
-    Otherwise, fetches from geoBoundaries automatically.
-    
-    Args:
-        map_ax: Cartopy GeoAxes
-        region_name: Name of the region
-        country_name: Country name (optional, helps with filtering)
-        admin_level: Explicit admin level (optional, auto-detects if None)
-        custom_geojson: Custom GeoJSON to use instead of fetching
-    
-    Returns:
-        bool: True if boundary was drawn successfully
-    """
+def draw_geojson_outline(map_ax, geom_dict: Dict, color: str = "#0d1b2a",
+                         linewidth: float = 1.5):
+    """Draw a GeoJSON geometry / Feature / FeatureCollection outline on a cartopy axes."""
     import cartopy.crs as ccrs
-    from shapely.geometry import shape
-    
-    try:
-        # Use custom GeoJSON if provided
-        if custom_geojson:
-            geom_dict = custom_geojson
-            info = BoundaryAgent.get_boundary_info(region_name)
-            print(f"Using custom GeoJSON for '{region_name}'")
-        else:
-            # Fetch boundary automatically
-            geom_dict = BoundaryAgent.fetch_boundary(region_name, country_name, admin_level)
-            if not geom_dict:
-                return False
-            
-            info = BoundaryAgent.get_boundary_info(region_name, admin_level)
-        
-        # Draw the boundary
-        _draw_geom_on_map(map_ax, geom_dict, 
-                         color=info['boundary_color'],
-                         linewidth=info['line_width'],
-                         label=f"{info['admin_type']}: {region_name}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"Error drawing boundary: {e}")
-        return False
 
-
-def _draw_geom_on_map(map_ax, geom_dict: Dict, color: str = "#000000",
-                      linewidth: float = 1.5, label: str = ""):
-    """
-    Internal function to draw GeoJSON geometry on map.
-    """
-    import cartopy.crs as ccrs
-    
+    if not geom_dict:
+        return
     gtype = geom_dict.get("type", "")
-    
-    if gtype == "Polygon":
+
+    def _ring(ring):
+        xs = [c[0] for c in ring]
+        ys = [c[1] for c in ring]
+        map_ax.plot(xs, ys, color=color, linewidth=linewidth, linestyle="-",
+                    transform=ccrs.PlateCarree(), zorder=5)
+
+    if gtype == "FeatureCollection":
+        for feat in geom_dict.get("features", []):
+            draw_geojson_outline(map_ax, feat.get("geometry"), color, linewidth)
+    elif gtype == "Feature":
+        draw_geojson_outline(map_ax, geom_dict.get("geometry"), color, linewidth)
+    elif gtype == "Polygon":
         for ring in geom_dict["coordinates"]:
-            xs = [c[0] for c in ring]
-            ys = [c[1] for c in ring]
-            map_ax.plot(xs, ys, color=color, linewidth=linewidth,
-                       linestyle="-", transform=ccrs.PlateCarree(),
-                       zorder=5, label=label if label else "_nolegend_")
-    
+            _ring(ring)
     elif gtype == "MultiPolygon":
         for poly_coords in geom_dict["coordinates"]:
             for ring in poly_coords:
-                xs = [c[0] for c in ring]
-                ys = [c[1] for c in ring]
-                map_ax.plot(xs, ys, color=color, linewidth=linewidth,
-                           linestyle="-", transform=ccrs.PlateCarree(),
-                           zorder=5, label=label if label else "_nolegend_")
-    
+                _ring(ring)
     elif gtype == "GeometryCollection":
         for g in geom_dict.get("geometries", []):
-            _draw_geom_on_map(map_ax, g, color, linewidth, label)
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Initialize Earth Engine (requires authentication)
-    # ee.Authenticate()
-    ee.Initialize()
-    
-    # Test the agent
-    print("=== Boundary Detection Agent Test ===\n")
-    
-    test_cases = [
-        "Sri Lanka",
-        "Western Province",
-        "Jaffna District",
-        "Jaffna",
-        "Northern",
-    ]
-    
-    for region in test_cases:
-        admin_level, admin_type = BoundaryAgent.detect_admin_level(region)
-        info = BoundaryAgent.get_boundary_info(region)
-        print(f"Region: '{region}'")
-        print(f"  → Admin Level: ADM{admin_level} ({admin_type})")
-        print(f"  → Dataset: {info['dataset']}")
-        print(f"  → Color: {info['boundary_color']}")
-        print(f"  → Line Width: {info['line_width']}\n")
+            draw_geojson_outline(map_ax, g, color, linewidth)

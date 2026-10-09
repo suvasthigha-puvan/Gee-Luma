@@ -21,6 +21,7 @@ import time
 import requests
 import re
 import unicodedata
+from datetime import date, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import textwrap
@@ -73,7 +74,7 @@ from cloud_masking import (
     mask_modis_clouds, mask_viirs_clouds,
 )
 from dataset_config import (
-    COLLECTION_ALIASES, LULC_CLASS_SCHEMAS, DATASET_BAND_MAP,
+    COLLECTION_ALIASES, LULC_CLASS_SCHEMAS, LULC_BAND_LUT, DATASET_BAND_MAP,
     detect_lulc_class_filter, apply_lulc_class_filter,
     build_lulc_class_legend, full_lulc_legend, generic_discrete_legend,
     lulc_classes_for_display, lulc_vis_for_classes,
@@ -90,6 +91,19 @@ from geojson_helpers import (
     get_geojson_bounds, get_geojson_label,
 )
 from boundary_agent import BoundaryAgent
+
+# Ways to combine the images of a period into one map.
+TEMPORAL_REDUCERS = {
+    "median": ee.Reducer.median, "mean": ee.Reducer.mean, "sum": ee.Reducer.sum,
+    "max": ee.Reducer.max, "min": ee.Reducer.min, "mode": ee.Reducer.mode,
+}
+# Used when the agent does not name a reducer; anything not listed uses median.
+DEFAULT_REDUCER_BY_MAP_TYPE = {
+    "PRECIPITATION": "sum", "ET": "sum", "PET": "sum",
+    "LANDCOVER": "mode", "FIRE": "max",
+    "LST": "mean", "TEMPERATURE": "mean", "NIGHTLIGHTS": "mean", "SOIL_MOISTURE": "mean",
+    "NO2": "mean", "CO": "mean", "AEROSOL": "mean", "CH4": "mean", "SO2": "mean",
+}
 
 # ====================== PAGE CONFIG ======================
 _page_icon_path = Path("icon.png")
@@ -240,6 +254,9 @@ with col1:
 # ====================== MAIN GENERATION LOGIC ======================
 if generate and user_prompt and "llm" in st.session_state:
 
+    # A new request replaces the previous map, even if this one fails.
+    st.session_state.pop("last_result", None)
+
     apply_cloud_removal = user_wants_cloud_removal(user_prompt)
 
     spyndex_index_summary = ""
@@ -274,6 +291,7 @@ if generate and user_prompt and "llm" in st.session_state:
         task = Task(
             description=f"""
 User request: "{user_prompt}"
+Today's date is {date.today().isoformat()}. Resolve relative periods ("last 3 months", "this year", "recent") against this date. date_end must never be later than today.
 {"" if uploaded_region_geojson is None else f'NOTE: The user has uploaded a custom region shapefile named "{uploaded_region_label}". Use this as the "region" field value in your JSON response. The geometry will be applied automatically  you do NOT need to know its coordinates.'}
 
 === KNOWLEDGE BASE ===
@@ -290,9 +308,18 @@ Required fields:
 - "map_type": one of PRECOMPUTED | SPYNDEX | RGB | FALSE_COLOR | SWIR | SAR_RGB | ELEVATION | SLOPE | ASPECT | HILLSHADE | LANDCOVER | LST | NIGHTLIGHTS | PRECIPITATION | TEMPERATURE | WATER | SOIL_MOISTURE | TREECOVER | FOREST_LOSS | BIOMASS | CANOPY_HEIGHT | FIRE | NO2 | CO | AEROSOL | CH4 | SO2 | POPULATION | ET | PET
 - "precomputed_band": GEE band name to select directly when map_type is PRECOMPUTED; empty string otherwise
 - "precomputed_scale": numeric scale factor for the precomputed band; use 1.0 if no scaling needed
-- "region": country or place name
+- "region": the place name exactly as an administrative unit is named, without words like "District" or "Province" (e.g. "Galle", "Western", "Nepal", "Bavaria")
+- "country": English name of the country that contains the region (same as "region" when the region is itself a country; "" when the region is not inside a single country)
+- "country_iso3": ISO 3166-1 alpha-3 code of that country (e.g. "LKA", "DEU", "USA"); "" when there is no single country
+- "region_aliases": list of other names the region is officially known by, especially its local-language name (e.g. ["Bayern"] for Bavaria, ["Sachsen"] for Saxony); [] if none
+- "admin_level": 0 if the region is a country, 1 if it is a province/state, 2 if it is a district/county, null if it is not an administrative unit (continent, river basin, city area, multi-country region)
+- "bbox": [west, south, east, north] in decimal degrees, an approximate bounding box of the region. Always provide it; it is used when no administrative boundary exists (e.g. "Europe", "Amazon rainforest", "Nile Delta").
 - "date_start": YYYY-MM-DD
 - "date_end": YYYY-MM-DD
+- "temporal_reducer": how the images in the date range are combined into one map. One of median | mean | sum | max | min | mode.
+  median: reflectance and spectral indices (default). mean: temperature, LST, gas concentrations, night lights, soil moisture.
+  sum: accumulated totals where every image is a total for its own period (daily/monthly rainfall in mm, 8-day ET). Never sum rates such as mm/hr.
+  max: fire masks, peak values. mode: categorical data such as land cover classes.
 - "cloud_cover": integer 0-100 (default 85; irrelevant for SAR/DEM/static datasets)
 - "band_override": dict mapping spyndex variable letters OR role names to actual GEE band names.
   For SPYNDEX: include variable  band (e.g. {{"N":"B8","R":"B4","G":"B3","B":"B2"}})
@@ -317,6 +344,7 @@ DECISION RULES (apply in order):
 7. Historical before 2014  do NOT use Sentinel-2
 8. Tropical/cloudy  prefer MODIS (precomputed) or Landsat over Sentinel-2
 9. Static datasets  is_temporal=false
+10. Land cover / LULC without a specified dataset  ESA/WorldCover/v200, map_type="LANDCOVER", is_temporal=false
 
 UNLISTED COLLECTION RULE: If the user's dataset is not a common sensor you already know well
 and is not in the Precomputed Band Registry, call the search_gee_catalog tool with descriptive
@@ -329,16 +357,16 @@ returns nothing useful, fall back to your best-effort knowledge rather than bloc
 Examples:
 
 NDVI via MODIS (precomputed):
-{{"collection":"MODIS/061/MOD13Q1","index":"","map_type":"PRECOMPUTED","precomputed_band":"NDVI","precomputed_scale":0.0001,"region":"Sri Lanka","date_start":"2024-01-01","date_end":"2024-03-31","cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"MOD13Q1 has precomputed NDVI; used directly."}}
+{{"collection":"MODIS/061/MOD13Q1","index":"","map_type":"PRECOMPUTED","precomputed_band":"NDVI","precomputed_scale":0.0001,"region":"Sri Lanka","country":"Sri Lanka","country_iso3":"LKA","region_aliases":[],"admin_level":0,"bbox":[79.5,5.9,81.9,9.9],"date_start":"2024-01-01","date_end":"2024-03-31","temporal_reducer":"median","cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"MOD13Q1 has precomputed NDVI; used directly."}}
 
 NDVI via Sentinel-2 (spyndex):
-{{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"NDVI","map_type":"SPYNDEX","precomputed_band":"","precomputed_scale":1.0,"region":"Germany","date_start":"2024-06-01","date_end":"2024-08-31","cloud_cover":20,"band_override":{{"N":"B8","R":"B4"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 has no precomputed NDVI; computing via spyndex."}}
+{{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"NDVI","map_type":"SPYNDEX","precomputed_band":"","precomputed_scale":1.0,"region":"Germany","country":"Germany","country_iso3":"DEU","region_aliases":[],"admin_level":0,"bbox":[5.8,47.2,15.1,55.1],"date_start":"2024-06-01","date_end":"2024-08-31","temporal_reducer":"median","cloud_cover":20,"band_override":{{"N":"B8","R":"B4"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 has no precomputed NDVI; computing via spyndex."}}
 
 ET via MODIS (precomputed):
-{{"collection":"MODIS/061/MOD16A2GF","index":"","map_type":"PRECOMPUTED","precomputed_band":"ET","precomputed_scale":0.1,"region":"India","date_start":"2024-01-01","date_end":"2024-12-31","cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":1.0,"scale_offset":0.0,"notes":"MOD16A2GF provides precomputed ET."}}
+{{"collection":"MODIS/061/MOD16A2GF","index":"","map_type":"PRECOMPUTED","precomputed_band":"ET","precomputed_scale":0.1,"region":"India","country":"India","country_iso3":"IND","region_aliases":[],"admin_level":0,"bbox":[68.1,6.5,97.4,35.7],"date_start":"2024-01-01","date_end":"2024-12-31","temporal_reducer":"sum","cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":1.0,"scale_offset":0.0,"notes":"MOD16A2GF provides precomputed ET."}}
 
 RGB Sentinel-2:
-{{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"","map_type":"RGB","precomputed_band":"","precomputed_scale":1.0,"region":"Tokyo","date_start":"2024-03-01","date_end":"2024-04-01","cloud_cover":20,"band_override":{{"red":"B4","green":"B3","blue":"B2","nir":"B8","swir1":"B11","swir2":"B12"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 true-color composite."}}
+{{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"","map_type":"RGB","precomputed_band":"","precomputed_scale":1.0,"region":"Tokyo","country":"Japan","country_iso3":"JPN","region_aliases":[],"admin_level":1,"bbox":[138.9,35.5,139.95,35.9],"date_start":"2024-03-01","date_end":"2024-04-01","temporal_reducer":"median","cloud_cover":20,"band_override":{{"red":"B4","green":"B3","blue":"B2","nir":"B8","swir1":"B11","swir2":"B12"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 true-color composite."}}
 """,
             agent=agent,
             expected_output="Valid JSON only",
@@ -347,26 +375,35 @@ RGB Sentinel-2:
         crew   = Crew(agents=[agent], tasks=[task], verbose=False, process="sequential")
         result = crew.kickoff()
 
+    # A failed parse must stop here: substituting a default map would hand the
+    # user a plausible-looking map of something they did not ask for.
+    raw = (getattr(result, "raw", "") or "").strip()
     try:
-        raw = result.raw.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1].strip()
-            if raw.startswith("json"):
-                raw = raw[4:].strip()
-        params = json.loads(raw)
+        params = json.loads(raw[raw.index("{"): raw.rindex("}") + 1])
+        if not isinstance(params, dict):
+            raise ValueError("not a JSON object")
     except Exception:
-        st.warning("Could not parse agent output - using NDVI fallback.")
-        params = {
-            "collection": "MODIS/061/MOD13Q1", "index": "",
-            "map_type": "PRECOMPUTED", "precomputed_band": "NDVI",
-            "precomputed_scale": 0.0001, "region": "Sri Lanka",
-            "date_start": "2024-01-01", "date_end": "2024-12-31",
-            "cloud_cover": 85, "band_override": {}, "is_temporal": True,
-            "scale_factor": 0.0001, "scale_offset": 0.0,
-            "notes": "Fallback: MODIS precomputed NDVI."
-        }
+        st.error(
+            "The AI agent's answer could not be read, so no map was generated. "
+            "Please try again, or rephrase the request."
+        )
+        with st.expander("Agent's raw answer"):
+            st.code(raw or "(empty)")
+        st.stop()
 
-    cid = COLLECTION_ALIASES.get(params.get("collection", ""), params.get("collection", "MODIS/061/MOD13Q1"))
+    missing = [f for f in ("collection", "map_type") if not str(params.get(f) or "").strip()]
+    if uploaded_region_geojson is None and not str(params.get("region") or "").strip():
+        missing.append("region")
+    if missing:
+        st.error(
+            f"The AI agent could not work out the **{', '.join(missing)}** from your request, "
+            "so no map was generated. Please state it explicitly and try again."
+        )
+        with st.expander("Agent Decision"):
+            st.json(params)
+        st.stop()
+
+    cid = COLLECTION_ALIASES.get(params["collection"], params["collection"])
     params["collection"] = cid
 
     with st.expander("Agent Decision", expanded=False):
@@ -376,17 +413,28 @@ RGB Sentinel-2:
         st.json(params)
 
     try:
-        region_name       = params.get("region", "Sri Lanka").strip().title()
-        index_name        = params.get("index", "").upper()
-        map_type          = params.get("map_type", "SPYNDEX").upper()
-        date_start        = params.get("date_start", "2024-01-01")
-        date_end          = params.get("date_end",   "2024-12-31")
+        region_name       = str(params.get("region") or "").strip()
+        if region_name.islower():
+            region_name = region_name.title()
+        index_name        = str(params.get("index") or "").upper()
+        map_type          = str(params["map_type"]).upper()
+        today             = date.today()
+        date_start        = str(params.get("date_start") or "").strip()
+        date_end          = str(params.get("date_end") or "").strip()
+        if not date_start or not date_end:
+            date_end   = today.isoformat()
+            date_start = (today - timedelta(days=365)).isoformat()
+            if bool(params.get("is_temporal", True)):
+                st.info(f"No period was given, so the last 12 months are used ({date_start} to {date_end}).")
+        if date_end > today.isoformat():
+            date_end = today.isoformat()
         cloud_cover       = int(params.get("cloud_cover", 85))
         band_override     = params.get("band_override", {}) or {}
         agent_scale_f     = float(params.get("scale_factor", 1.0))
         agent_scale_o     = float(params.get("scale_offset", 0.0))
         agent_is_temporal = bool(params.get("is_temporal", True))
 
+        region_is_bbox = False
         if uploaded_region_geojson is not None:
             display_region_name = uploaded_region_label or region_name
             status_region = st.status(f"Using uploaded region: **{ascii_label(display_region_name)}**", expanded=True)
@@ -409,16 +457,41 @@ RGB Sentinel-2:
         if uploaded_region_geojson is None:
             status_region = st.status(f"Resolving boundary for **{ascii_label(region_name)}**", expanded=True)
             try:
-                admin_level, admin_type = BoundaryAgent.detect_admin_level(region_name)
-                geom_dict = BoundaryAgent.fetch_boundary(region_name, country_name="Sri Lanka", admin_level=admin_level)
-                if geom_dict is None:
-                    raise ValueError(
-                        f"No boundary found for '{region_name}' in the geoBoundaries dataset."
-                    )
-                region_geom = ee.Geometry(geom_dict)
-                status_region.update(
-                    label=f"Region resolved: {ascii_label(region_name)} ({admin_type})", state="complete"
+                agent_level = params.get("admin_level")
+                agent_level = agent_level if agent_level in (0, 1, 2) else None
+                found = BoundaryAgent.resolve(
+                    region_name,
+                    country_name=str(params.get("country") or "").strip() or None,
+                    admin_level=agent_level,
+                    country_iso3=str(params.get("country_iso3") or "").strip() or None,
+                    aliases=params.get("region_aliases") if isinstance(params.get("region_aliases"), list) else None,
                 )
+                if found is not None:
+                    region_geom = found["geometry"]
+                    status_region.update(
+                        label=f"Region resolved: {ascii_label(region_name)} ({found['admin_type']})",
+                        state="complete",
+                    )
+                else:
+                    # Not an administrative unit (continent, basin, ...): use the
+                    # agent's approximate bounding box rather than failing.
+                    bbox = params.get("bbox")
+                    try:
+                        west, south, east, north = (float(v) for v in bbox)
+                        bbox_ok = (-180 <= west < east <= 180) and (-90 <= south < north <= 90)
+                    except Exception:
+                        bbox_ok = False
+                    if not bbox_ok:
+                        raise ValueError(
+                            f"No boundary found for '{region_name}' in the geoBoundaries dataset."
+                        )
+                    region_geom = ee.Geometry.Rectangle([west, south, east, north], None, False)
+                    region_is_bbox = True
+                    status_region.update(
+                        label=f"No administrative boundary for {ascii_label(region_name)} - "
+                              "using an approximate bounding box",
+                        state="complete",
+                    )
             except Exception as e:
                 status_region.update(label=f"Could not resolve '{ascii_label(region_name)}'", state="error")
                 st.error(
@@ -441,11 +514,24 @@ RGB Sentinel-2:
         except Exception:
             geo_bounds = None
 
+        # Outline drawn on the map: the same boundary the data is clipped to.
+        boundary_geojson = None
+        if uploaded_region_geojson is None and not region_is_bbox:
+            boundary_geojson = BoundaryAgent.outline_geojson(region_geom, geo_bounds)
+
         status_intro = st.status(f"Inspecting dataset `{cid}`", expanded=False)
         col_info = introspect_collection(cid)
-        if col_info["error"]:
-            st.warning(f"Dataset introspection warning: {col_info['error']}")
         n_bands = len(col_info["bands"])
+        if col_info["error"] or n_bands == 0:
+            # The agent named a dataset that cannot be opened as imagery.
+            # Continuing would only fail later with an unrelated-looking error.
+            status_intro.update(label=f"Dataset `{cid}` could not be opened", state="error")
+            st.error(
+                f"The dataset the AI agent chose, `{cid}`, could not be opened as imagery "
+                f"({col_info['error'] or 'it has no image bands'}). No map was generated. "
+                "Try naming the dataset in your request, e.g. 'using ESA WorldCover' or 'using MODIS'."
+            )
+            st.stop()
         status_intro.update(
             label=f"Dataset: {n_bands} band{'s' if n_bands != 1 else ''} detected" + (" (static)" if col_info["is_static"] else ""),
             state="complete"
@@ -479,12 +565,25 @@ RGB Sentinel-2:
         cloud_mask_fn         = CLOUD_MASK_FUNCTIONS.get(cid)
         cloud_removal_applied = apply_cloud_removal and (cloud_mask_fn is not None) and (not is_static)
 
+        # How the images in the period are combined. Categorical data must never
+        # be averaged, so land cover always uses the most common class.
+        reducer_name = str(params.get("temporal_reducer") or "").lower()
+        if reducer_name not in TEMPORAL_REDUCERS:
+            reducer_name = DEFAULT_REDUCER_BY_MAP_TYPE.get(map_type, "median")
+        if requested_lulc:
+            reducer_name = "mode"
+
         status_col = st.status(f"Loading dataset `{cid}`", expanded=True)
 
         if is_static:
             try:
                 if col_info["is_image_collection"]:
-                    img = ee.ImageCollection(cid).filterBounds(region_geom).mosaic()
+                    static_col = ee.ImageCollection(cid).filterBounds(region_geom)
+                    if cid in LULC_BAND_LUT:
+                        # Some land cover collections add bands in later years;
+                        # mosaicking needs the same bands in every image.
+                        static_col = static_col.select(LULC_BAND_LUT[cid])
+                    img = static_col.mosaic()
                 else:
                     img = ee.Image(cid)
             except Exception:
@@ -527,10 +626,11 @@ RGB Sentinel-2:
                 else:
                     st.warning("Try expanding the date range or raising the cloud cover threshold.")
                 st.stop()
-            img = col.median()
+            img = col.reduce(TEMPORAL_REDUCERS[reducer_name]()).rename(col.first().bandNames())
 
         status_col.update(
-            label=(f"Dataset loaded ({n_images} image{'s' if n_images != 1 else ''})"
+            label=(f"Dataset loaded ({n_images} image{'s' if n_images != 1 else ''}"
+                   + ("" if is_static else f", {reducer_name} composite") + ")"
                    + (" - Cloud masked" if cloud_removal_applied else "")),
             state="complete"
         )
@@ -597,11 +697,21 @@ RGB Sentinel-2:
             result_img, vis_params_raw = compute_special_map(
                 img, map_type, cid, band_map, scale_cfg,
                 lulc_class_values=lulc_class_values if map_type == "LANDCOVER" else None,
+                available_bands=col_info.get("bands"),
+                preferred_band=str(params.get("precomputed_band") or "") or None,
             )
             display_label  = INDEX_PALETTES.get(map_type, {}).get("label", map_type)
             vis_params_gee = {k: v for k, v in vis_params_raw.items() if k != "label"}
             final_img      = result_img.clip(region_geom)
             map_label      = map_type
+
+        # A total over the period has a different range from a single image,
+        # so the fixed per-image colour range is replaced by the data's own range.
+        if reducer_name == "sum" and not is_static and "palette" in vis_params_gee:
+            auto = auto_vis_params(final_img, map_label, region_geom)
+            if auto["max"] > auto["min"]:
+                vis_params_gee["min"], vis_params_gee["max"] = auto["min"], auto["max"]
+            display_label = "Total " + str(display_label).replace("(mm/day)", "(mm)")
 
         # Apply sidebar palette override
         palette_override = palette_presets.get(selected_palette)
@@ -614,25 +724,16 @@ RGB Sentinel-2:
         map_pil, final_dim = fetch_thumbnail_with_retry(final_img, vis_params_gee, region_geom)
         status_thumb.update(label=f"Thumbnail fetched at {final_dim}px", state="complete")
 
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.markdown(metric_card(ascii_label(map_label), "Map Index", accent=True), unsafe_allow_html=True)
-        with m2:
-            st.markdown(metric_card(ascii_label(region_name), "Region"), unsafe_allow_html=True)
-        with m3:
-            st.markdown(metric_card(str(n_images), "Scenes"), unsafe_allow_html=True)
-        with m4:
-            if cloud_removal_applied:
-                engine_lbl = "Cloud masked"
-            elif apply_cloud_removal and not cloud_removal_applied:
-                engine_lbl = "Cloud filtered"
-            elif map_type == "PRECOMPUTED":
-                engine_lbl = "Precomputed"
-            elif map_type == "SPYNDEX":
-                engine_lbl = "Spyndex"
-            else:
-                engine_lbl = "Built-in"
-            st.markdown(metric_card(engine_lbl, "Engine"), unsafe_allow_html=True)
+        if cloud_removal_applied:
+            engine_lbl = "Cloud masked"
+        elif apply_cloud_removal and not cloud_removal_applied:
+            engine_lbl = "Cloud filtered"
+        elif map_type == "PRECOMPUTED":
+            engine_lbl = "Precomputed"
+        elif map_type == "SPYNDEX":
+            engine_lbl = "Spyndex"
+        else:
+            engine_lbl = "Built-in"
 
         status_render = st.status("Rendering cartographic layout", expanded=True)
         is_rgb = "bands" in vis_params_gee and len(vis_params_gee["bands"]) == 3
@@ -683,49 +784,34 @@ RGB Sentinel-2:
             region_geom           = region_geom,
             uploaded_geojson      = uploaded_region_geojson,
             custom_title          = map_title_override.strip() or None,
+            boundary_geojson      = boundary_geojson,
         )
         status_render.update(label="Cartographic layout rendered", state="complete")
 
-        st.markdown(section_label("Map Output"), unsafe_allow_html=True)
-        st.image(png_bytes, use_column_width=True,
-                 caption=f"{ascii_label(map_label)} - {ascii_label(region_name)} - {cid}"
-                         + (" - Cloud masked" if cloud_removal_applied else ""))
-        st.success("Map generated successfully"
-                   + (" with pixel-level cloud masking applied." if cloud_removal_applied else "."))
-
+        # Keep the finished map in the session: Streamlit reruns this script on
+        # every click (including "Download"), and the map must survive that.
         suffix = "_cloudmasked" if cloud_removal_applied else ""
-        fname  = f"{ascii_label(map_label)}_{ascii_label(region_name).replace(' ','_')}_{date_start[:4]}{suffix}.png"
-        st.download_button(label="Download Map PNG", data=png_bytes,
-                           file_name=fname, mime="image/png")
-
+        result_data = {
+            "png_bytes":  png_bytes,
+            "map_label":  ascii_label(map_label),
+            "region":     ascii_label(region_name),
+            "n_images":   n_images,
+            "engine":     engine_lbl,
+            "collection": cid,
+            "cloud_removal_applied": cloud_removal_applied,
+            "file_name":  f"{ascii_label(map_label)}_{ascii_label(region_name).replace(' ','_')}_{date_start[:4]}{suffix}.png",
+            "index_info": None,
+            "cloud_mask_fn": cloud_mask_fn.__name__ if cloud_removal_applied else None,
+        }
         if map_type == "SPYNDEX" and SPYNDEX_AVAILABLE and index_name in spyndex.indices:
             idx_info = spyndex.indices[index_name]
-            with st.expander(f"About {index_name} - {idx_info.long_name}"):
-                st.markdown(f"**Formula:** `{idx_info.formula}`")
-                st.markdown(f"**Domain:** {idx_info.application_domain}")
-                st.markdown(f"**Required bands:** {', '.join(idx_info.bands)}")
-                st.markdown(f"**Reference:** {idx_info.reference}")
-                if col_info["bands"]:
-                    st.markdown(f"**Available bands in `{cid}`:** `{', '.join(col_info['bands'])}`")
-                if band_override:
-                    st.markdown(f"**Band mapping used:** `{band_override}`")
-
-        if cloud_removal_applied:
-            with st.expander("Cloud Removal Details"):
-                fn_name = cloud_mask_fn.__name__
-                desc_map = {
-                    "mask_s2_clouds":        "Sentinel-2 SR - QA60 bitmask (bits 10 and 11: opaque and cirrus clouds)",
-                    "mask_s2_toa_clouds":    "Sentinel-2 TOA - QA60 bitmask (bits 10 and 11: opaque and cirrus clouds)",
-                    "mask_landsat_c2_clouds":"Landsat Collection 2 - QA_PIXEL bitmask (bit 3: cloud, bit 4: cloud shadow)",
-                    "mask_modis_clouds":     "MODIS MOD09GA - state_1km QA band (bits 0-1: cloud state = clear)",
-                    "mask_viirs_clouds":     "VIIRS VNP09GA - QF1 quality flag (bits 2-3: confident/probably clear)",
-                }
-                st.markdown(f"**Method:** {desc_map.get(fn_name, fn_name)}")
-                st.markdown(f"**Dataset:** `{cid}`")
-                st.markdown(
-                    "Pixel-level cloud masking was applied before computing the median composite. "
-                    "Masked pixels are excluded from index computation."
-                )
+            result_data["index_info"] = {
+                "name": index_name, "long_name": idx_info.long_name,
+                "formula": idx_info.formula, "domain": idx_info.application_domain,
+                "bands": list(idx_info.bands), "reference": idx_info.reference,
+                "available_bands": col_info["bands"], "band_override": band_override,
+            }
+        st.session_state["last_result"] = result_data
 
     except Exception as e:
         st.error(f"Map generation failed: {e}")
@@ -741,6 +827,58 @@ RGB Sentinel-2:
 
 elif generate and "llm" not in st.session_state:
     st.warning("Please enter your OpenAI API key first.")
+
+# ====================== MAP OUTPUT ======================
+# Rendered from session state so the map stays on screen across reruns.
+if "last_result" in st.session_state:
+    res = st.session_state["last_result"]
+    cloud_note = " - Cloud masked" if res["cloud_removal_applied"] else ""
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.markdown(metric_card(res["map_label"], "Map Index", accent=True), unsafe_allow_html=True)
+    with m2:
+        st.markdown(metric_card(res["region"], "Region"), unsafe_allow_html=True)
+    with m3:
+        st.markdown(metric_card(str(res["n_images"]), "Scenes"), unsafe_allow_html=True)
+    with m4:
+        st.markdown(metric_card(res["engine"], "Engine"), unsafe_allow_html=True)
+
+    st.markdown(section_label("Map Output"), unsafe_allow_html=True)
+    st.image(res["png_bytes"], use_column_width=True,
+             caption=f"{res['map_label']} - {res['region']} - {res['collection']}{cloud_note}")
+    st.success("Map generated successfully"
+               + (" with pixel-level cloud masking applied." if res["cloud_removal_applied"] else "."))
+    st.download_button(label="Download Map PNG", data=res["png_bytes"],
+                       file_name=res["file_name"], mime="image/png")
+
+    info = res["index_info"]
+    if info:
+        with st.expander(f"About {info['name']} - {info['long_name']}"):
+            st.markdown(f"**Formula:** `{info['formula']}`")
+            st.markdown(f"**Domain:** {info['domain']}")
+            st.markdown(f"**Required bands:** {', '.join(info['bands'])}")
+            st.markdown(f"**Reference:** {info['reference']}")
+            if info["available_bands"]:
+                st.markdown(f"**Available bands in `{res['collection']}`:** `{', '.join(info['available_bands'])}`")
+            if info["band_override"]:
+                st.markdown(f"**Band mapping used:** `{info['band_override']}`")
+
+    if res["cloud_mask_fn"]:
+        with st.expander("Cloud Removal Details"):
+            desc_map = {
+                "mask_s2_clouds":        "Sentinel-2 SR - QA60 bitmask (bits 10 and 11: opaque and cirrus clouds)",
+                "mask_s2_toa_clouds":    "Sentinel-2 TOA - QA60 bitmask (bits 10 and 11: opaque and cirrus clouds)",
+                "mask_landsat_c2_clouds":"Landsat Collection 2 - QA_PIXEL bitmask (bit 3: cloud, bit 4: cloud shadow)",
+                "mask_modis_clouds":     "MODIS MOD09GA - state_1km QA band (bits 0-1: cloud state = clear)",
+                "mask_viirs_clouds":     "VIIRS VNP09GA - QF1 quality flag (bits 2-3: confident/probably clear)",
+            }
+            st.markdown(f"**Method:** {desc_map.get(res['cloud_mask_fn'], res['cloud_mask_fn'])}")
+            st.markdown(f"**Dataset:** `{res['collection']}`")
+            st.markdown(
+                "Pixel-level cloud masking was applied before computing the composite. "
+                "Masked pixels are excluded from index computation."
+            )
 
 # ====================== FOOTER ======================
 spyndex_count = len(spyndex.indices) if SPYNDEX_AVAILABLE else 0
