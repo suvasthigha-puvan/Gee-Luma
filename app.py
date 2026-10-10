@@ -163,6 +163,24 @@ DEFAULT_REDUCER_BY_MAP_TYPE = {
     "NO2": "mean", "CO": "mean", "AEROSOL": "mean", "CH4": "mean", "SO2": "mean",
 }
 
+def data_coverage_percent(image, band: str, region_geom, scale: float) -> float:
+    """Share of the region (0-100) where `band` of `image` has data, i.e. is not masked."""
+    valid_m2 = (ee.Image.pixelArea().updateMask(image.select([band]).mask()).rename("area")
+                .reduceRegion(reducer=ee.Reducer.sum(), geometry=region_geom, scale=scale,
+                              bestEffort=True, maxPixels=1e6).get("area"))
+    percent = (ee.Number(ee.Algorithms.If(valid_m2, valid_m2, 0))
+               .divide(region_geom.area(maxError=100)).multiply(100).getInfo())
+    return float(min(max(percent, 0.0), 100.0))
+
+
+# Gap filling: when cloud leaves holes in the requested period, they are
+# filled from imagery of the surrounding dates, nearest first.
+GAP_FILL_BELOW_PERCENT = 97      # fill when less of the region than this has data
+GAP_FILL_STEPS = 3               # how many times the window may be widened
+GAP_FILL_OPT_OUT = ("no gap fill", "without gap fill", "no gap-fill", "don't fill", "do not fill",
+                    "no filling", "original only", "unfilled")
+
+
 def _stretch(widget) -> dict:
     """
     Keyword arguments that make a widget fill its container.
@@ -222,6 +240,15 @@ palette_presets = {
     "Spectral":    ['#9E0142','#D53E4F','#FDAE61','#FEE08B','#E6F598','#3288BD','#5E4FA2'],
 }
 selected_palette = st.sidebar.selectbox("Color Palette Override", list(palette_presets.keys()))
+
+fill_gaps_option = st.sidebar.checkbox(
+    "Fill cloud gaps from nearby dates", value=True,
+    help=(
+        "When cloud leaves holes in the requested period, fill them with imagery from the "
+        "weeks before and after it. The original, unfilled map stays available next to the "
+        "filled one."
+    ),
+)
 
 st.sidebar.markdown("---")
 uploaded_geojson_file = st.sidebar.file_uploader(
@@ -744,6 +771,8 @@ RGB Sentinel-2:
 
         status_col = st.status(f"Loading dataset `{cid}`", expanded=True)
         period_note = None
+        gap_fill = None           # details of gap filling, when it was applied
+        original_mask = None      # where the requested period itself had data
 
         if is_static:
             try:
@@ -811,7 +840,70 @@ RGB Sentinel-2:
                 st.stop()
             if single_band:
                 col = col.select(single_band)
-            img = col.reduce(TEMPORAL_REDUCERS[reducer_name]()).rename(col.first().bandNames())
+            composite_bands = col.first().bandNames()
+            img = col.reduce(TEMPORAL_REDUCERS[reducer_name]()).rename(composite_bands)
+
+            # ---------------- GAP FILLING ----------------
+            # Totals are not filled: adding rain from other months would change
+            # what the number means. A period that was already replaced by the
+            # nearest available image is left alone too.
+            fill_wanted = (fill_gaps_option and reducer_name != "sum" and period_note is None
+                           and not any(k in user_prompt.lower() for k in GAP_FILL_OPT_OUT))
+            if fill_wanted:
+                try:
+                    mask_band = single_band or next(
+                        (b for b in (band_map.get("red"), band_map.get("nir"), band_map.get("vv")) if b in bands),
+                        bands[0])
+                    coverage_scale = max(float((meta or {}).get("gsd") or 30), 30)
+                    original_cov = data_coverage_percent(img, mask_band, region_geom, coverage_scale)
+                    if original_cov < GAP_FILL_BELOW_PERCENT:
+                        status_fill = st.status(
+                            f"Only {original_cov:.0f}% of the region has data - filling gaps from nearby dates",
+                            expanded=True)
+                        start_day, end_day = date.fromisoformat(date_start), date.fromisoformat(date_end)
+                        step_days = min(max((end_day - start_day).days, 30), 90)
+
+                        def _composite_for(window_start, window_end):
+                            window = base_col.filterDate(window_start, window_end)
+                            if cloud_prop:
+                                window = window.filter(ee.Filter.lt(cloud_prop, cloud_cover))
+                            if cloud_removal_applied:
+                                window = apply_cloud_mask(window, cid)
+                            if single_band:
+                                window = window.select(single_band)
+                            return window.reduce(TEMPORAL_REDUCERS[reducer_name]()).rename(composite_bands)
+
+                        wider, filled, filled_cov, days_used = [], img, original_cov, 0
+                        for k in range(1, GAP_FILL_STEPS + 1):
+                            window_start = (start_day - timedelta(days=k * step_days)).isoformat()
+                            window_end = min(end_day + timedelta(days=k * step_days), today).isoformat()
+                            wider.append(_composite_for(window_start, window_end))
+                            # Later images in a mosaic win, so the order is: widest
+                            # window at the bottom, nearer windows above it, and the
+                            # requested period on top - every pixel comes from the
+                            # nearest dates that have data for it.
+                            filled = ee.ImageCollection.fromImages(list(reversed(wider)) + [img]).mosaic()
+                            filled_cov = data_coverage_percent(filled, mask_band, region_geom, coverage_scale)
+                            days_used = k * step_days
+                            status_fill.update(
+                                label=f"Gap filling: {filled_cov:.0f}% of the region covered using "
+                                      f"{days_used} days before and after")
+                            if filled_cov >= GAP_FILL_BELOW_PERCENT:
+                                break
+                        if filled_cov - original_cov >= 1.0:
+                            original_mask = img.select([mask_band]).mask()
+                            img = filled
+                            gap_fill = {"original_percent": original_cov, "filled_percent": filled_cov,
+                                        "days": days_used, "window_start": window_start, "window_end": window_end}
+                            status_fill.update(
+                                label=f"Gaps filled: {original_cov:.0f}% -> {filled_cov:.0f}% of the region "
+                                      f"(imagery from {window_start} to {window_end})",
+                                state="complete")
+                        else:
+                            status_fill.update(
+                                label="No extra data found in nearby dates - map left as it is", state="complete")
+                except Exception as e:
+                    st.caption(f"Gap filling was skipped ({e}).")
 
         status_col.update(
             label=(f"Dataset loaded ({n_images} image{'s' if n_images != 1 else ''}"
@@ -1012,6 +1104,7 @@ RGB Sentinel-2:
         # ---------------- STATISTICS ----------------
         # Computed from the same image that is drawn, so numbers and map agree.
         stats, stats_lines = None, None
+        legend_without_shares = [dict(entry) for entry in lulc_legend] if lulc_legend else None
         if not is_rgb:
             status_stats = st.status("Computing statistics for the region", expanded=False)
             stats_scale = max(float((meta or {}).get("gsd") or 30), 10)
@@ -1048,6 +1141,8 @@ RGB Sentinel-2:
                 stats_lines.append(f"Region area {stats['area_km2']:,.0f} km2")
                 if stats.get("coverage_percent") is not None:
                     stats_lines.append(f"Valid data over {stats['coverage_percent']:.0f}% of region")
+                if gap_fill:
+                    stats_lines.append(f"({gap_fill['original_percent']:.0f}% from the period, rest gap-filled)")
             status_stats.update(
                 label="Statistics computed" if stats else "Statistics could not be computed",
                 state="complete" if stats else "error")
@@ -1095,6 +1190,11 @@ RGB Sentinel-2:
             processing += f"; cloud masking: {cloud_mask_desc}"
         if cloud_prop and not is_static:
             processing += f"; scenes under {cloud_cover}% cloud"
+        processing_original = processing
+        if gap_fill:
+            processing += (f"; cloud gaps filled with imagery from {gap_fill['window_start']} to "
+                           f"{gap_fill['window_end']} (the period alone covers "
+                           f"{gap_fill['original_percent']:.0f}% of the region)")
 
         credit_lines = [
             f"Data: {dataset_title}" + (f" ({meta['provider']})" if meta and meta["provider"] else "")
@@ -1105,8 +1205,7 @@ RGB Sentinel-2:
             + f" Map produced {date.today().isoformat()} with Gee-Luma on Google Earth Engine.",
         ]
 
-        rendered = render_cartographic_figure(
-            map_pil_image    = map_pil,
+        render_kwargs = dict(
             extent           = extent,
             projection       = projection,
             title            = map_title_override.strip() or f"{title_label} - {region_name}",
@@ -1122,6 +1221,26 @@ RGB Sentinel-2:
             credit_lines     = credit_lines,
             stats_lines      = stats_lines,
         )
+        rendered = render_cartographic_figure(map_pil_image=map_pil, **render_kwargs)
+
+        # The original, unfilled map: the same result with the filled pixels
+        # masked out again. It is rendered only if the user asks for it.
+        original_job = None
+        if gap_fill:
+            original_credit = list(credit_lines)
+            original_credit[1] = f"Processing: {processing_original}. No gap filling."
+            original_job = {
+                "image": final_img.updateMask(original_mask),
+                "vis_params": vis_params_gee,
+                "target_px": target_px,
+                "render_kwargs": {
+                    **render_kwargs,
+                    "lulc_legend": legend_without_shares,
+                    "credit_lines": original_credit,
+                    "stats_lines": [f"Valid data over {gap_fill['original_percent']:.0f}% of region",
+                                    "(no gap filling)"] if stats_lines else None,
+                },
+            }
         status_render.update(label="Cartographic layout rendered", state="complete")
 
         # GeoTIFF of the data itself: real values (or the dataset's class
@@ -1147,6 +1266,8 @@ RGB Sentinel-2:
             }) if stats else None,
             "value_label": ascii_label(display_label),
             "geotiff":    geotiff,
+            "gap_fill":   gap_fill,
+            "original_job": original_job,
             "map_label":  ascii_label(map_label),
             "region":     ascii_label(region_name),
             "n_images":   n_images,
@@ -1199,8 +1320,48 @@ if "last_result" in st.session_state:
         st.markdown(metric_card(res["engine"], "Engine"), unsafe_allow_html=True)
 
     st.markdown(section_label("Map Output"), unsafe_allow_html=True)
-    st.image(res["png_bytes"], **_stretch(st.image),
-             caption=f"{res['map_label']} - {res['region']} - {res['collection']}{cloud_note}")
+    caption = f"{res['map_label']} - {res['region']} - {res['collection']}{cloud_note}"
+    fill = res.get("gap_fill")
+    if not fill:
+        st.image(res["png_bytes"], caption=caption, **_stretch(st.image))
+    else:
+        st.info(
+            f"Cloud left data over only **{fill['original_percent']:.0f}%** of the region in the requested period. "
+            f"The gaps were filled with imagery from {fill['window_start']} to {fill['window_end']}, "
+            f"so the map now covers **{fill['filled_percent']:.0f}%**. "
+            "The original map is in the second tab."
+        )
+        tab_filled, tab_original = st.tabs(["Gap-filled map", "Original map (no gap filling)"])
+        with tab_filled:
+            st.image(res["png_bytes"], caption=caption + " - Gap-filled", **_stretch(st.image))
+        with tab_original:
+            original = res.get("original")
+            if original:
+                st.image(original["png"], caption=caption + " - Original, no gap filling", **_stretch(st.image))
+                base = res["file_name"].rsplit(".", 1)[0]
+                o1, o2, _o3, _o4 = st.columns(4)
+                with o1:
+                    st.download_button("Download Original PNG", data=original["png"],
+                                       file_name=f"{base}_original.png", mime="image/png",
+                                       **_stretch(st.download_button))
+                with o2:
+                    st.download_button("Download Original PDF", data=original["pdf"],
+                                       file_name=f"{base}_original.pdf", mime="application/pdf",
+                                       **_stretch(st.download_button))
+            else:
+                st.caption("The map exactly as the requested period shows it, with cloud gaps left empty.")
+                if st.button("Render original map"):
+                    job = res["original_job"]
+                    try:
+                        with st.spinner("Rendering the original map..."):
+                            original_pil, _dim = fetch_thumbnail_with_retry(
+                                job["image"], job["vis_params"], job["render_kwargs"]["extent"],
+                                job["render_kwargs"]["projection"]["crs"], target_long_side=job["target_px"])
+                            res["original"] = render_cartographic_figure(
+                                map_pil_image=original_pil, **job["render_kwargs"])
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"The original map could not be rendered: {e}")
     st.success("Map generated successfully"
                + (" with pixel-level cloud masking applied." if res["cloud_removal_applied"] else "."))
     base_name = res["file_name"].rsplit(".", 1)[0]
@@ -1251,7 +1412,8 @@ if "last_result" in st.session_state:
             if coverage < 60:
                 st.warning(
                     f"Only {coverage:.0f}% of the region has data - the rest was masked (usually cloud) or is "
-                    "missing from the dataset. A longer period usually fills the gaps."
+                    "missing from the dataset"
+                    + (", even after gap filling." if res.get("gap_fill") else ". A longer period usually fills the gaps.")
                 )
         if stats["kind"] == "categorical":
             table = pd.DataFrame([

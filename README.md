@@ -85,6 +85,12 @@ Vector (table) datasets are not supported yet.
 - Rendered at about 2,000 px on the long side, exported at 300 dpi
 - Cloud masking applied by default for Sentinel-2 (Cloud Score+), Landsat, MODIS and
   VIIRS surface reflectance; add "keep clouds" to a request to turn it off
+- Cloud gaps filled from nearby dates: when less than 97% of the region has data in
+  the requested period, the gaps are filled with imagery from the weeks before and
+  after it (nearest first, up to three widening steps). The map and its credit block
+  say so, and the original unfilled map is available in a second tab. Turn it off with
+  the sidebar switch or by adding "no gap fill" to the request. Totals (sums) are
+  never filled.
 - Graticule, true-length scale bar, north arrow, locator map
 - Legend in real units, with the colour range fitted to the data in the region
 - Credit block: dataset title and provider, Earth Engine ID, period, compositing
