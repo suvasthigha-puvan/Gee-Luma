@@ -47,9 +47,15 @@ def _clean_text(text) -> str:
 def _short_label(description: str, max_len: int = 34) -> str:
     """First phrase of a class description, short enough for a legend row."""
     # Cut at the end of the first sentence or clause (not at a decimal point).
-    text = re.split(r"\.(?:\s|$)|[:;(]", _clean_text(description), maxsplit=1)[0].strip().replace("_", " ")
+    text = _clean_text(description)
+    # Hierarchical class names ("Forest > Forests > Coniferous forest"): the last level names the class.
+    if " > " in text:
+        text = text.rsplit(" > ", 1)[1]
+    # A bullet list after the phrase ("Loss type * 2 - Tidal Flat * 3 - ...") is not part of it.
+    text = re.split(r"\.(?:\s|$)|[:;(]|\s\*\s", text, maxsplit=1)[0].strip().replace("_", " ")
     if len(text) > max_len:
         text = text[:max_len].rsplit(" ", 1)[0].rstrip(" ,-/")     # cut at a word boundary
+        text = re.sub(r"(\s+(and|or|of|with|the|in|to|for))+$", "", text)
     return text or str(description)[:max_len]
 
 

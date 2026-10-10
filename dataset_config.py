@@ -280,8 +280,11 @@ def detect_lulc_class_filter(prompt: str, cid: str, require_only: bool = False) 
                 return dataset_map[cid]
             # Dataset without a keyword table: match the theme against class names.
             words = _CLASS_THEME_WORDS.get(keyword, [keyword])
-            return [value for value, entry in schema.items()
-                    if any(w in entry["label"].lower() for w in words)]
+            matched = [value for value, entry in schema.items()
+                       if any(w in entry["label"].lower() for w in words)]
+            # Many matches without "only" means the theme is the dataset's
+            # whole subject (a crop type map), not a subset of it.
+            return matched if explicit or len(matched) <= 3 else []
     return []
 
 

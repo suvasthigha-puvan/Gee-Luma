@@ -41,6 +41,7 @@ gee-luma/
 ├── projection.py        # Chooses a map projection for the region
 ├── thumbnail.py         # Tiled, parallel high-resolution image fetch
 ├── cartography.py       # Final map layout (PNG and PDF)
+├── class_legend.py      # Class legends for classified bands of any dataset
 ├── map_stats.py         # Region statistics and CSV export
 ├── exports.py           # GeoTIFF export of the data values
 ├── styles.py            # Custom CSS and page header HTML
@@ -128,6 +129,13 @@ Vector (table) datasets are not supported yet.
   never filled.
 - Graticule, true-length scale bar, north arrow, locator map
 - Legend in real units, with the colour range fitted to the data in the region
+- Class legends for every classified band, whatever the dataset publishes: the
+  catalog's own class names and colours where it lists them; distinct colours assigned
+  where it lists names only; names read from the band description where classes are
+  only written out there; and classes labelled by value where nothing is published
+  (the band is recognised as classified from its data). Only classes present in the
+  region are listed, long legends show the largest classes and sum up the rest, and
+  "only" in a request ("crop class only") maps just those classes.
 - Credit block: dataset title and provider, Earth Engine ID, period, compositing
   method, cloud masking, projection, native resolution, production date
 - Optional custom title
