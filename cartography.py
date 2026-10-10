@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.patheffects as patheffects
 import matplotlib.colors as mcolors
 import matplotlib.colorbar as mcolorbar
 import matplotlib.gridspec as mgridspec
@@ -75,26 +76,23 @@ def _draw_map_scale_bar(map_ax, extent, projection, lat_mid):
     bar_h = 0.010 * height
     crs   = projection["cartopy"]
 
-    # White backing so the bar stays readable over any imagery
-    map_ax.add_patch(mpatches.Rectangle(
-        (x0 - 0.02 * width, y0 - 0.014 * height),
-        length + 0.09 * width, bar_h + 0.062 * height,
-        facecolor="white", edgecolor=_FRAME_COL, lw=0.5, alpha=0.88,
-        transform=crs, zorder=8))
+    # No background box, so nothing of the map is hidden. A white outline
+    # around the bar and its labels keeps them readable over dark data.
+    halo = [patheffects.withStroke(linewidth=2.2, foreground="white")]
 
     quarter = length / 4.0
     for i in range(4):
         map_ax.add_patch(mpatches.Rectangle(
             (x0 + i * quarter, y0), quarter, bar_h,
             facecolor="#111827" if i % 2 == 0 else "white", edgecolor="#111827", lw=0.6,
-            transform=crs, zorder=9))
+            transform=crs, zorder=9, path_effects=halo))
 
     y_text = y0 + bar_h + 0.008 * height
     for x, label in ((x0, "0"),
                      (x0 + length / 2, f"{length_km / 2:g}"),
                      (x0 + length, _fmt_distance(length_km))):
         map_ax.text(x, y_text, label, ha="center", va="bottom", fontsize=7,
-                    color=_TEXT_DARK, transform=crs, zorder=9)
+                    color=_TEXT_DARK, transform=crs, zorder=9, path_effects=halo)
 
 
 # ====================== LEGENDS ======================

@@ -15,6 +15,7 @@ warnings.warn = _make_warn_skip_file_prefixes_compatible(warnings.warn)
 
 # ====================== STDLIB / THIRD-PARTY IMPORTS ======================
 import os
+import inspect
 import json
 import io
 import time
@@ -162,6 +163,21 @@ DEFAULT_REDUCER_BY_MAP_TYPE = {
     "NO2": "mean", "CO": "mean", "AEROSOL": "mean", "CH4": "mean", "SO2": "mean",
 }
 
+def _stretch(widget) -> dict:
+    """
+    Keyword arguments that make a widget fill its container.
+
+    Streamlit replaced `use_container_width=True` (and st.image's
+    `use_column_width`) with `width="stretch"`, and shows a deprecation notice
+    in the page when the old ones are used. This picks whichever the installed
+    version expects.
+    """
+    width_param = inspect.signature(widget).parameters.get("width")
+    if width_param is not None and isinstance(width_param.default, str):
+        return {"width": "stretch"}
+    return {"use_container_width": True}
+
+
 # ====================== PAGE CONFIG ======================
 _page_icon_path = Path("icon.png")
 PAGE_ICON = str(_page_icon_path) if _page_icon_path.exists() else "🛰️"
@@ -242,7 +258,7 @@ if uploaded_geojson_file is not None:
                       if wgs84_geojson.get("type") == "FeatureCollection" else 1)
         st.sidebar.caption(f"{n_features} polygon{'s' if n_features != 1 else ''}  ·  WGS-84")
 
-        if st.sidebar.button("✕ Remove region", use_container_width=True):
+        if st.sidebar.button("✕ Remove region", **_stretch(st.button)):
             uploaded_region_geojson = None
             uploaded_region_label   = None
             st.rerun()
@@ -306,7 +322,7 @@ map_title_override = st.text_input(
 
 col1, col2 = st.columns([1, 4])
 with col1:
-    generate = st.button("GENERATE MAP", type="primary", use_container_width=True)
+    generate = st.button("GENERATE MAP", type="primary", **_stretch(st.button))
 
 # ====================== MAIN GENERATION LOGIC ======================
 if generate and user_prompt and "llm" in st.session_state:
@@ -1073,7 +1089,7 @@ RGB Sentinel-2:
             subtitle = f"{date_start}" if date_start == date_end else f"{date_start} to {date_end}"
             processing = f"Single image, {subtitle}"
         else:
-            subtitle = f"{date_start} to {date_end} | {reducer_name} of {n_images} images"
+            subtitle = f"{date_start} to {date_end}"
             processing = f"{reducer_name.capitalize()} composite of {n_images} images, {date_start} to {date_end}"
         if cloud_removal_applied:
             processing += f"; cloud masking: {cloud_mask_desc}"
@@ -1183,7 +1199,7 @@ if "last_result" in st.session_state:
         st.markdown(metric_card(res["engine"], "Engine"), unsafe_allow_html=True)
 
     st.markdown(section_label("Map Output"), unsafe_allow_html=True)
-    st.image(res["png_bytes"], use_column_width=True,
+    st.image(res["png_bytes"], **_stretch(st.image),
              caption=f"{res['map_label']} - {res['region']} - {res['collection']}{cloud_note}")
     st.success("Map generated successfully"
                + (" with pixel-level cloud masking applied." if res["cloud_removal_applied"] else "."))
@@ -1191,23 +1207,23 @@ if "last_result" in st.session_state:
     d1, d2, d3, d4 = st.columns(4)
     with d1:
         st.download_button(label="Download Map PNG", data=res["png_bytes"],
-                           file_name=f"{base_name}.png", mime="image/png", use_container_width=True)
+                           file_name=f"{base_name}.png", mime="image/png", **_stretch(st.download_button))
     with d2:
         st.download_button(label="Download Map PDF", data=res["pdf_bytes"],
-                           file_name=f"{base_name}.pdf", mime="application/pdf", use_container_width=True)
+                           file_name=f"{base_name}.pdf", mime="application/pdf", **_stretch(st.download_button))
     with d3:
         if res["stats_csv"]:
             st.download_button(label="Download Statistics CSV", data=res["stats_csv"],
                                file_name=f"{base_name}_statistics.csv", mime="text/csv",
-                               use_container_width=True)
+                               **_stretch(st.download_button))
     with d4:
         geotiff = res["geotiff"]
         if geotiff and "bytes" in geotiff:
             st.download_button(label="Download GeoTIFF", data=geotiff["bytes"],
-                               file_name=f"{base_name}.tif", mime="image/tiff", use_container_width=True)
+                               file_name=f"{base_name}.tif", mime="image/tiff", **_stretch(st.download_button))
         elif geotiff:
             # Fetched on request: the file can be tens of megabytes.
-            if st.button("Prepare GeoTIFF", use_container_width=True):
+            if st.button("Prepare GeoTIFF", **_stretch(st.button)):
                 try:
                     with st.spinner("Downloading GeoTIFF from Earth Engine..."):
                         geotiff["bytes"] = fetch_geotiff(geotiff["url"])
@@ -1244,7 +1260,7 @@ if "last_result" in st.session_state:
             ])
             t1, t2 = st.columns([1, 1])
             with t1:
-                st.dataframe(table, hide_index=True, use_container_width=True)
+                st.dataframe(table, hide_index=True, **_stretch(st.dataframe))
             with t2:
                 st.bar_chart(table.set_index("Class")["Share (%)"])
         else:
@@ -1252,7 +1268,7 @@ if "last_result" in st.session_state:
                                   for name, value in stats["rows"]])
             t1, t2 = st.columns([1, 1])
             with t1:
-                st.dataframe(table, hide_index=True, use_container_width=True)
+                st.dataframe(table, hide_index=True, **_stretch(st.dataframe))
             with t2:
                 if stats["histogram"]:
                     hist = pd.DataFrame({
