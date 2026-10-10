@@ -225,13 +225,66 @@ LULC_BAND_LUT: dict[str, str] = {
 # Helper functions
 # ---------------------------------------------------------------------------
 
+# Words in a class name that identify it as belonging to a theme the user may
+# ask for. Used for datasets with no hand-written keyword table.
+_CLASS_THEME_WORDS: dict[str, list[str]] = {
+    "crop": ["crop", "agricultur", "cultivat", "farm", "paddy"],
+    "agriculture": ["crop", "agricultur", "cultivat", "farm", "paddy"],
+    "cropland": ["crop", "agricultur", "cultivat", "farm", "paddy"],
+    "farmland": ["crop", "agricultur", "cultivat", "farm", "paddy"],
+    "forest": ["forest", "tree"],
+    "water": ["water"],
+    "urban": ["urban", "built", "settlement", "developed"],
+    "built": ["urban", "built", "settlement", "developed"],
+    "grass": ["grass", "herbaceous", "pasture"],
+    "shrub": ["shrub", "scrub"],
+    "wetland": ["wetland", "flooded", "marsh"],
+    "bare": ["bare", "barren"],
+    "snow": ["snow", "ice"],
+    "mangrove": ["mangrove"],
+}
+
+
 def detect_lulc_class_filter(prompt: str, cid: str) -> list[int]:
     """Parse user prompt for LULC class filter keywords. Returns class IDs or []."""
     lower = prompt.lower()
     for keyword, dataset_map in LULC_CLASS_KEYWORDS.items():
         if keyword in lower:
-            return dataset_map.get(cid, [])
+            if cid in dataset_map:
+                return dataset_map[cid]
+            # Dataset without a keyword table: match the theme against class names.
+            words = _CLASS_THEME_WORDS.get(keyword, [keyword])
+            return [value for value, entry in LULC_CLASS_SCHEMAS.get(cid, {}).items()
+                    if any(w in entry["label"].lower() for w in words)]
     return []
+
+
+def register_stac_classes(cid: str, band: str, meta: dict | None) -> bool:
+    """
+    Make a categorical band of any catalog dataset usable by the class-legend
+    machinery, using the class values, names and colours the catalog publishes.
+
+    Hand-written schemas are kept when they are at least as complete, since
+    their labels are tuned for the legend. Returns True if `band` of `cid` now
+    has a class schema.
+    """
+    classes = ((meta or {}).get("bands", {}).get(band) or {}).get("classes") or []
+    existing = LULC_CLASS_SCHEMAS.get(cid) if LULC_BAND_LUT.get(cid) == band else None
+    if classes and (existing is None or len(classes) > len(existing)):
+        LULC_CLASS_SCHEMAS[cid] = {
+            int(c["value"]): {"label": c["label"], "color": c["color"].upper()} for c in classes
+        }
+        LULC_BAND_LUT[cid] = band
+        return True
+    return existing is not None
+
+
+def first_categorical_band(meta: dict | None) -> str | None:
+    """Name of the first band the catalog describes with class values, if any."""
+    for name, info in (meta or {}).get("bands", {}).items():
+        if info.get("classes"):
+            return name
+    return None
 
 
 def apply_lulc_class_filter(img: ee.Image, lc_band: str, class_values: list[int]) -> ee.Image:
@@ -437,6 +490,41 @@ def detect_cloud_prop(cid: str, col_info: dict) -> str | None:
 
 def is_sar_collection(cid: str) -> bool:
     return DATASET_SENSOR.get(cid, "generic") in ("sar", "s1_sar")
+
+
+def auto_rgb_stretch(img: ee.Image, bands: list[str], region_geom, per_band: bool = False,
+                     percentile: int = 2) -> dict | None:
+    """
+    Display range for a 3-band composite from the data's own percentiles over
+    the region, so the image uses the full brightness range whatever the
+    sensor's units are.
+
+    per_band=False gives one common range for all three bands, which keeps
+    the colour balance of true-colour imagery. per_band=True stretches each
+    band separately, for composites whose bands are different quantities
+    (e.g. radar VV, VH and their difference).
+    Returns {"min": ..., "max": ...} or None if statistics could not be computed.
+    """
+    try:
+        stats = img.select(bands).reduceRegion(
+            reducer=ee.Reducer.percentile([percentile, 100 - percentile]),
+            geometry=region_geom, scale=200, maxPixels=1e8, bestEffort=True,
+        ).getInfo()
+        lows  = [stats.get(f"{b}_p{percentile}") for b in bands]
+        highs = [stats.get(f"{b}_p{100 - percentile}") for b in bands]
+        if any(v is None for v in lows + highs):
+            return None
+        if per_band:
+            if any(hi <= lo for lo, hi in zip(lows, highs)):
+                return None
+            return {"min": lows, "max": highs}
+        # Headroom above the brightest band keeps highlights from clipping and
+        # stops vegetation looking over-saturated.
+        lo, hi = min(lows), max(highs)
+        hi = lo + (hi - lo) * 1.3
+        return {"min": lo, "max": hi} if hi > lo else None
+    except Exception:
+        return None
 
 
 def auto_vis_params(img: ee.Image, band: str, region_geom, percentile: int = 2) -> dict:

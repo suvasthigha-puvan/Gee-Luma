@@ -54,6 +54,8 @@ INDEX_PALETTES = {
     "ET":           {"min":0,   "max":100, "palette":['#FFFFF0','#C7E9B4','#7FCDBB','#41B6C4','#1D91C0','#225EA8','#0C2C84'],"label":"ET (kg/m2)"},
     "PET":          {"min":0,   "max":200, "palette":['#FFFFF0','#FEE5D9','#FCAE91','#FB6A4A','#DE2D26','#A50F15'],"label":"PET (kg/m2)"},
     "EVI2":         {"min":-0.2,"max":1.0, "palette":['#8B0000','#FF4500','#FFFF00','#90EE90','#006400'],"label":"EVI2"},
+    # Neutral ramp for any continuous variable with no dedicated palette.
+    "GENERIC":        {"min": 0, "max": 1,  "palette":['#440154','#3E4A89','#26828E','#35B779','#FDE725'],"label":"Value"},
     "SPYNDEX_GENERIC":{"min":-1,"max":1,  "palette":['#8B0000','#FF4500','#FFFF00','#90EE90','#006400'],"label":"Index"},
 }
 

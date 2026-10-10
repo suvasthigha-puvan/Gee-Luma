@@ -52,6 +52,37 @@ COMMUNITY_CATALOG_URL = (
 
 _FETCH_TIMEOUT = 15  # seconds
 
+# Well-established global datasets per theme. When a search touches one of
+# these themes the dataset is returned first and marked as recommended, so a
+# general request ("land cover of X") gets the standard product rather than
+# whichever regional or coarse dataset happens to match the words.
+RECOMMENDED_DATASETS: list[tuple[tuple[str, ...], str, str]] = [
+    (("land cover", "landcover", "land use", "lulc", "cropland", "farmland", "built-up area"), "ESA/WorldCover/v200", "ESA WorldCover 10m v200 (global land cover, 2021)"),
+    (("elevation", "dem", "terrain", "slope", "hillshade", "aspect"), "USGS/SRTMGL1_003", "NASA SRTM Digital Elevation 30m"),
+    (("rain", "rainfall", "precipitation"), "UCSB-CHG/CHIRPS/DAILY", "CHIRPS Daily Precipitation (global, 1981-present)"),
+    (("land surface temperature", "lst"), "MODIS/061/MOD11A2", "MODIS Terra Land Surface Temperature 8-Day 1km"),
+    (("night light", "nighttime", "night-time"), "NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG", "VIIRS Nighttime Day/Night Band Monthly Composites"),
+    (("population",), "WorldPop/GP/100m/pop", "WorldPop Global Project Population Data 100m"),
+    (("surface water", "water occurrence"), "JRC/GSW1_4/GlobalSurfaceWater", "JRC Global Surface Water Mapping Layers v1.4"),
+    (("no2", "nitrogen dioxide"), "COPERNICUS/S5P/OFFL/L3_NO2", "Sentinel-5P OFFL NO2: Offline Nitrogen Dioxide"),
+    (("carbon monoxide",), "COPERNICUS/S5P/OFFL/L3_CO", "Sentinel-5P OFFL CO: Offline Carbon Monoxide"),
+    (("methane", "ch4"), "COPERNICUS/S5P/OFFL/L3_CH4", "Sentinel-5P OFFL CH4: Offline Methane"),
+    (("so2", "sulphur dioxide", "sulfur dioxide"), "COPERNICUS/S5P/OFFL/L3_SO2", "Sentinel-5P OFFL SO2: Offline Sulphur Dioxide"),
+    (("evapotranspiration",), "MODIS/061/MOD16A2GF", "MODIS Terra Net Evapotranspiration Gap-Filled 8-Day 500m"),
+    (("air temperature", "2m temperature"), "ECMWF/ERA5_LAND/MONTHLY_AGGR", "ERA5-Land Monthly Aggregated - ECMWF Climate Reanalysis"),
+]
+
+
+def recommended_for(text: str) -> list[tuple[str, str]]:
+    """(id, title) of the standard datasets for every theme mentioned in `text`."""
+    lower = text.lower()
+    matches = []
+    for phrases, rec_id, rec_title in RECOMMENDED_DATASETS:
+        # Whole words only: "rain" must not match "rainforest".
+        if any(re.search(r"\b" + re.escape(ph) + r"s?\b", lower) for ph in phrases):
+            matches.append((rec_id, rec_title))
+    return matches
+
 
 @st.cache_resource(ttl=24 * 3600, show_spinner=False)
 def _load_catalogs() -> dict[str, Any]:
@@ -128,9 +159,22 @@ def search_gee_catalog(
             if s > 0:
                 pool.append((s, dataset, "community"))
 
+    # Official catalog datasets first: they are global or clearly scoped,
+    # maintained, and documented. Community datasets are often regional
+    # (one country) and are only offered when the official catalog has few
+    # matches for the query.
     pool.sort(key=lambda t: t[0], reverse=True)
+    official = [t for t in pool if t[2] == "official"]
+    community = [t for t in pool if t[2] == "community"]
+    pool = official + (community if len(official) < 3 else [])
 
     results = []
+    for rec_id, rec_title in recommended_for(" ".join(keywords)):
+        results.append({
+            "id": rec_id, "title": rec_title, "source": "official", "recommended": True,
+            "note": "Standard global dataset for this theme. Use it unless the user named a different dataset.",
+        })
+    pool = [t for t in pool if t[1].get("id") not in {r["id"] for r in results}]
     for score, dataset, source in pool[:max_results]:
         dtype = dataset.get("type", "unknown")
         results.append({
@@ -173,7 +217,9 @@ def search_gee_catalog_tool(query: str, max_results: int = 8) -> str:
     Returns a JSON string: a list of candidate datasets, each with the real
     GEE collection ID ("id"), a ready-to-use "ee_snippet", "title", "type"
     (image_collection / image / table), "provider", and "source" (official
-    or community catalog). Pick the best match and use its "id" verbatim as
+    or community catalog). Prefer "official" results. Community datasets are
+    often limited to one country or region - only use one if its title shows
+    it covers the user's region. Pick the best match and use its "id" verbatim as
     the "collection" field in your final answer - never invent or guess an
     ID when this tool is available to you.
     """

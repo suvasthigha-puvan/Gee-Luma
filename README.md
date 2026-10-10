@@ -1,72 +1,99 @@
 # Gee-Luma — GEE Map Studio
 
-AI-powered Google Earth Engine map generator built with Streamlit, CrewAI, and spyndex.
+Describe a map in plain English; Gee-Luma finds the dataset in Google Earth Engine,
+processes it, and returns a print-ready cartographic map.
 
-## Project Structure
+Built with Streamlit, CrewAI, Earth Engine and spyndex.
+
+## How it works
+
+1. **Agent** (CrewAI + GPT-4o-mini) reads the request and chooses the dataset, band,
+   region, period and compositing method. It searches the live Earth Engine catalog
+   and checks the dataset's real bands before answering.
+2. **Dataset metadata** is read from the public Earth Engine STAC catalog: scale and
+   offset, units, class names and colours, coverage period, provider. This is what
+   lets the app map datasets it has no built-in knowledge of.
+3. **Region** is resolved from geoBoundaries (any country, province/state or district),
+   from an uploaded GeoJSON, or — for areas that are not administrative units — from
+   an approximate bounding box.
+4. **Processing** runs on Earth Engine: cloud masking, compositing over the period,
+   index computation, scaling to real units.
+5. **Rendering** fetches the result at print resolution in a projection suited to the
+   region and lays out the final map.
+
+## Project structure
 
 ```
 gee-luma/
-├── app.py               # Main Streamlit entry point
+├── app.py               # Streamlit entry point and request pipeline
+├── catalog_search.py    # Live Earth Engine catalog search (agent tool)
+├── stac_metadata.py     # Per-dataset metadata from the EE STAC catalog (agent tool)
+├── boundary_agent.py    # Place name -> admin boundary (geoBoundaries, any country)
+├── geojson_helpers.py   # Uploaded GeoJSON: reprojection + ee.Geometry conversion
+├── dataset_config.py    # Sensor band maps, class schemas, colour-range statistics
+├── cloud_masking.py     # Per-sensor cloud/shadow masking (Cloud Score+, QA bands)
+├── map_engine.py        # Index computation (spyndex) and composite map types
+├── palettes.py          # Colour palettes per index and theme
+├── projection.py        # Chooses a map projection for the region
+├── thumbnail.py         # Tiled, parallel high-resolution image fetch
+├── cartography.py       # Final map layout (PNG export)
 ├── styles.py            # Custom CSS and page header HTML
-├── utils.py             # Shared helpers (ascii_label, warnings shim)
-├── cloud_masking.py     # Per-sensor cloud/shadow masking functions
-├── dataset_config.py    # Band maps, scale configs, LULC schemas, GEE introspection
-├── palettes.py          # Colour palettes for every index and map type
-├── map_engine.py        # GEE image computation (spyndex + special map types)
-├── cartography.py       # Cartographic figure renderer (PNG export)
-├── thumbnail.py         # GEE thumbnail fetcher with retry logic
-├── geojson_helpers.py   # GeoJSON CRS reprojection + ee.Geometry conversion
-├── requirements.txt
-├── .gitignore
-└── README.md
+├── utils.py             # Shared helpers
+├── knowledge_base.md    # Reference notes given to the agent
+└── requirements.txt
 ```
 
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Clone and enter the directory
-git clone <your-repo-url>
-cd gee-luma
+git clone https://github.com/suvasthigha-puvan/Gee-Luma.git
+cd Gee-Luma
 
-# 2. Create a virtual environment
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Authenticate with Google Earth Engine
 earthengine authenticate
-
-# 5. Set your OpenAI API key
 echo "OPENAI_API_KEY=sk-..." > .env
 
-# 6. Run the app
 streamlit run app.py
 ```
 
-## Key Features
+The Earth Engine project ID is set in `app.py` (`ee.Initialize(project=...)`); change it
+to your own project.
 
-- **AI-guided mission parsing** via CrewAI + GPT-4o-mini — describe your map in plain English
+## What you can ask for
+
+- **Any image dataset in the Earth Engine catalog** — name it, or describe the theme
+  and the standard global dataset is used (ESA WorldCover for land cover, SRTM for
+  elevation, CHIRPS for rainfall, and so on)
 - **200+ spectral indices** via spyndex (NDVI, kNDVI, EVI, NBR, MNDWI, …)
-- **Multi-sensor support**: Sentinel-2, Landsat 8/9, MODIS, VIIRS, Sentinel-1 SAR, SRTM, and more
-- **Pixel-level cloud masking** for optical sensors
-- **Custom region upload**: drag-in a GeoJSON shapefile (any CRS)
-- **Custom map title**: override the auto-generated figure title
-- **Cartographic export**: centered title, north arrow, dynamic scale bar, Jaffna district boundary, LULC legend
+- **Colour composites**: true colour, false colour, SWIR, Sentinel-1 radar
+- **Categorical products**: land cover and any other classified band, with the
+  dataset's own class names and colours
+- **Totals and averages** over a period (e.g. total rainfall for a year)
+- **Any region**: a country, province/state or district anywhere; an uploaded GeoJSON
+  (any CRS); or a larger area such as a continent
 
-## Map Title Override
+Vector (table) datasets are not supported yet.
 
-After typing your Earth observation mission, a **"Custom map title"** field lets you set
-a specific title on the exported PNG (e.g. *"Jaffna District Cropland 2021"*).
-Leave it blank to auto-generate the title from index name + region + date range.
+## The map
 
-## Environment Variables
+- Projection chosen per region: local UTM zone, or Lambert equal-area for wide regions
+- Rendered at about 2,000 px on the long side, exported at 300 dpi
+- Cloud masking applied by default for Sentinel-2 (Cloud Score+), Landsat, MODIS and
+  VIIRS surface reflectance; add "keep clouds" to a request to turn it off
+- Graticule, true-length scale bar, north arrow, locator map
+- Legend in real units, with the colour range fitted to the data in the region
+- Credit block: dataset title and provider, Earth Engine ID, period, compositing
+  method, cloud masking, projection, native resolution, production date
+- Optional custom title
 
-| Variable         | Description                           |
-|------------------|---------------------------------------|
-| `OPENAI_API_KEY` | Required for the CrewAI agent         |
-| `EE_PROJECT`     | Optional: GEE project ID override     |
+## Environment variables
+
+| Variable         | Description                   |
+|------------------|-------------------------------|
+| `OPENAI_API_KEY` | Required for the CrewAI agent |
 
 ## License
 

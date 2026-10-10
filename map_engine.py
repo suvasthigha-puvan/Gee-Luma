@@ -113,6 +113,9 @@ def compute_special_map(img, map_type, cid, band_map, scale_cfg, lulc_class_valu
             b = b.multiply(sf).add(offset)
         return b
 
+    # Elevation band name differs between DEM products.
+    elev_band = _pick_band(["elevation", "DEM", "DSM", "AVE_DSM", "b1"], available_bands, preferred_band)
+
     if map_type == "RGB":
         r  = scaled(band_map.get("red",   "B4"))
         g  = scaled(band_map.get("green", "B3"))
@@ -134,23 +137,20 @@ def compute_special_map(img, map_type, cid, band_map, scale_cfg, lulc_class_valu
     elif map_type == "SAR_RGB":
         vv    = img.select(band_map.get("vv", "VV"))
         vh    = img.select(band_map.get("vh", "VH"))
-        ratio = vv.divide(vh).rename("ratio")
+        # Backscatter is in dB (logarithmic), so the VV/VH ratio is a difference.
+        ratio = vv.subtract(vh).rename("ratio")
         return ee.Image.cat([vv, vh, ratio]).rename(["VV","VH","VVdVH"]), {"min":-25,"max":5,"bands":["VV","VH","VVdVH"]}
 
     elif map_type == "ELEVATION":
-        elev_band = "DEM" if "GLO30" in cid else "elevation"
         return img.select(elev_band).rename("ELEVATION"), {**get_palette("ELEVATION"), "bands":["ELEVATION"]}
 
     elif map_type == "SLOPE":
-        elev_band = "DEM" if "GLO30" in cid else "elevation"
         return ee.Terrain.slope(img.select(elev_band)).rename("SLOPE"), {**get_palette("SLOPE"), "bands":["SLOPE"]}
 
     elif map_type == "ASPECT":
-        elev_band = "DEM" if "GLO30" in cid else "elevation"
         return ee.Terrain.aspect(img.select(elev_band)).rename("ASPECT"), {**get_palette("ASPECT"), "bands":["ASPECT"]}
 
     elif map_type == "HILLSHADE":
-        elev_band = "DEM" if "GLO30" in cid else "elevation"
         return ee.Terrain.hillshade(img.select(elev_band)).rename("HILLSHADE"), {**get_palette("HILLSHADE"), "bands":["HILLSHADE"]}
 
     elif map_type == "LST":

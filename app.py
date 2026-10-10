@@ -26,7 +26,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import textwrap
 from crewai import Agent, Task, Crew, LLM
-from catalog_search import search_gee_catalog_tool
+from catalog_search import search_gee_catalog_tool, recommended_for
 
 try:
     from pyproj import Transformer, CRS
@@ -69,12 +69,12 @@ from styles import (
     section_label, metric_card,
 )
 from cloud_masking import (
-    CLOUD_MASK_FUNCTIONS, user_wants_cloud_removal,
-    mask_s2_clouds, mask_s2_toa_clouds, mask_landsat_c2_clouds,
-    mask_modis_clouds, mask_viirs_clouds,
+    user_wants_cloud_removal, user_declined_cloud_removal,
+    cloud_mask_method, apply_cloud_mask,
 )
 from dataset_config import (
-    COLLECTION_ALIASES, LULC_CLASS_SCHEMAS, LULC_BAND_LUT, DATASET_BAND_MAP,
+    COLLECTION_ALIASES, LULC_CLASS_SCHEMAS, LULC_BAND_LUT, DATASET_BAND_MAP, DATASET_SENSOR,
+    register_stac_classes, first_categorical_band, auto_rgb_stretch,
     detect_lulc_class_filter, apply_lulc_class_filter,
     build_lulc_class_legend, full_lulc_legend, generic_discrete_legend,
     lulc_classes_for_display, lulc_vis_for_classes,
@@ -84,7 +84,12 @@ from dataset_config import (
 )
 from palettes import INDEX_PALETTES, PRECOMPUTED_PALETTE_MAP, get_palette
 from map_engine import compute_spyndex_on_gee, compute_special_map
-from cartography import render_cartographic_figure, _dynamic_scale_ticks
+from cartography import render_cartographic_figure
+from projection import choose_map_projection, projected_extent
+from stac_metadata import (
+    fetch_dataset_metadata, get_dataset_info_tool,
+    stac_palette_for_band, band_display_label,
+)
 from thumbnail import fetch_thumbnail_with_retry
 from geojson_helpers import (
     _ensure_wgs84, geojson_to_ee_geometry,
@@ -97,6 +102,56 @@ TEMPORAL_REDUCERS = {
     "median": ee.Reducer.median, "mean": ee.Reducer.mean, "sum": ee.Reducer.sum,
     "max": ee.Reducer.max, "min": ee.Reducer.min, "mode": ee.Reducer.mode,
 }
+# Map types that show one variable of a thematic dataset. When the agent
+# names the band, these are drawn straight from it, whatever the dataset.
+THEMATIC_MAP_TYPES = {
+    "LST", "NIGHTLIGHTS", "PRECIPITATION", "TEMPERATURE", "WATER", "SOIL_MOISTURE",
+    "TREECOVER", "FOREST_LOSS", "BIOMASS", "CANOPY_HEIGHT", "FIRE", "NO2", "CO",
+    "AEROSOL", "CH4", "SO2", "POPULATION", "ET", "PET",
+}
+# Palettes whose value range is physically fixed (normalised indices,
+# percentages, angles). Everything else is stretched to the data in the region.
+FIXED_RANGE_KEYS = {
+    "NDVI", "EVI", "EVI2", "SAVI", "GNDVI", "NDRE", "kNDVI", "NDWI", "MNDWI", "NBR", "NBR2",
+    "NDSI", "BSI", "NDBI", "RVI", "RFDI", "WATER", "TREECOVER", "FOREST_LOSS", "ASPECT", "HILLSHADE",
+}
+MAP_TYPE_TITLES = {
+    "RGB": "True-colour image", "FALSE_COLOR": "False-colour composite (near infrared)",
+    "SWIR": "Shortwave-infrared composite", "SAR_RGB": "Radar backscatter composite",
+    "ELEVATION": "Elevation", "SLOPE": "Slope", "ASPECT": "Aspect", "HILLSHADE": "Hillshade",
+    "LANDCOVER": "Land cover", "LST": "Land surface temperature", "NIGHTLIGHTS": "Night-time lights",
+    "PRECIPITATION": "Precipitation", "TEMPERATURE": "Air temperature",
+    "WATER": "Surface water occurrence", "SOIL_MOISTURE": "Soil moisture", "TREECOVER": "Tree cover",
+    "FOREST_LOSS": "Forest loss", "BIOMASS": "Above-ground biomass", "CANOPY_HEIGHT": "Canopy height",
+    "FIRE": "Active fire", "NO2": "Nitrogen dioxide (NO2)", "CO": "Carbon monoxide (CO)",
+    "AEROSOL": "Aerosol index", "CH4": "Methane (CH4)", "SO2": "Sulphur dioxide (SO2)",
+    "POPULATION": "Population density", "ET": "Evapotranspiration", "PET": "Potential evapotranspiration",
+}
+# Words in a band's name or description that identify its theme, so a band
+# of any dataset gets the colours conventional for that variable.
+THEME_KEYWORDS = [
+    ("LST", ("land surface temperature", "lst")),
+    ("TEMPERATURE", ("temperature",)),
+    ("PRECIPITATION", ("precipitation", "rainfall", "rain")),
+    ("ELEVATION", ("elevation", "height above")),
+    ("SOIL_MOISTURE", ("soil moisture", "soil water")),
+    ("ET", ("evapotranspiration",)),
+    ("POPULATION", ("population",)),
+    ("NIGHTLIGHTS", ("radiance", "nighttime", "night-time")),
+    ("CANOPY_HEIGHT", ("canopy height",)),
+    ("BIOMASS", ("biomass",)),
+    ("NDVI", ("ndvi", "vegetation index")),
+]
+
+
+def infer_theme(band: str, description: str) -> str | None:
+    text = f"{band} {description}".lower().replace("_", " ")
+    for key, words in THEME_KEYWORDS:
+        if any(w in text for w in words):
+            return key
+    return None
+
+
 # Used when the agent does not name a reducer; anything not listed uses median.
 DEFAULT_REDUCER_BY_MAP_TYPE = {
     "PRECIPITATION": "sum", "ET": "sum", "PET": "sum",
@@ -257,13 +312,26 @@ if generate and user_prompt and "llm" in st.session_state:
     # A new request replaces the previous map, even if this one fails.
     st.session_state.pop("last_result", None)
 
-    apply_cloud_removal = user_wants_cloud_removal(user_prompt)
+    apply_cloud_removal    = user_wants_cloud_removal(user_prompt)      # asked for explicitly
+    cloud_masking_declined = user_declined_cloud_removal(user_prompt)   # asked to keep clouds
 
     spyndex_index_summary = ""
     if SPYNDEX_AVAILABLE:
         lines = [f"  {name}: {idx.long_name} [{idx.application_domain}] bands={list(idx.bands)}"
                  for name, idx in list(spyndex.indices.items())[:80]]
         spyndex_index_summary = "SPYNDEX INDICES (first 80 of {}):\n".format(len(spyndex.indices)) + "\n".join(lines)
+
+    # Standard dataset for the theme of the request, stated up front so a
+    # general request is not answered with an obscure or coarse dataset.
+    recommended = recommended_for(user_prompt)
+    recommended_note = ""
+    if recommended:
+        recommended_note = (
+            "STANDARD DATASET for this request: "
+            + "; ".join(f"{rec_id} ({rec_title})" for rec_id, rec_title in recommended)
+            + ". Use exactly this collection unless the user's request itself names a different "
+              "dataset, sensor or satellite.\n"
+        )
 
     with st.spinner("AI agent is analysing your request..."):
 
@@ -280,9 +348,11 @@ if generate and user_prompt and "llm" in st.session_state:
                 "real collection ID rather than guessing one from memory. Once you have a "
                 "collection ID (from your own knowledge or from the tool), you provide the "
                 "relevant band names via band_override, the correct scale_factor and "
-                "scale_offset, and set is_temporal appropriately."
+                "scale_offset, and set is_temporal appropriately. Before answering you ALWAYS "
+                "call the Get GEE Dataset Info tool on the collection you chose, and you only "
+                "ever use band names that tool returned."
             ),
-            tools=[search_gee_catalog_tool],
+            tools=[search_gee_catalog_tool, get_dataset_info_tool],
             llm=st.session_state.llm,
             verbose=False,
             allow_delegation=False,
@@ -291,7 +361,7 @@ if generate and user_prompt and "llm" in st.session_state:
         task = Task(
             description=f"""
 User request: "{user_prompt}"
-Today's date is {date.today().isoformat()}. Resolve relative periods ("last 3 months", "this year", "recent") against this date. date_end must never be later than today.
+{recommended_note}Today's date is {date.today().isoformat()}. Resolve relative periods ("last 3 months", "this year", "recent") against this date. date_end must never be later than today.
 {"" if uploaded_region_geojson is None else f'NOTE: The user has uploaded a custom region shapefile named "{uploaded_region_label}". Use this as the "region" field value in your JSON response. The geometry will be applied automatically  you do NOT need to know its coordinates.'}
 
 === KNOWLEDGE BASE ===
@@ -344,7 +414,20 @@ DECISION RULES (apply in order):
 7. Historical before 2014  do NOT use Sentinel-2
 8. Tropical/cloudy  prefer MODIS (precomputed) or Landsat over Sentinel-2
 9. Static datasets  is_temporal=false
-10. Land cover / LULC without a specified dataset  ESA/WorldCover/v200, map_type="LANDCOVER", is_temporal=false
+10. DEFAULT DATASETS - when the user does not name a dataset, use these global ones (do not search for alternatives):
+    land cover / LULC: ESA/WorldCover/v200 (band "Map", is_temporal=false) | elevation, slope, hillshade: USGS/SRTMGL1_003
+    rainfall: UCSB-CHG/CHIRPS/DAILY (band "precipitation", sum) | land surface temperature: MODIS/061/MOD11A2
+    night lights: NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG | population: WorldPop/GP/100m/pop | surface water: JRC/GSW1_4/GlobalSurfaceWater
+    true colour / spectral indices: COPERNICUS/S2_SR_HARMONIZED (2017 onwards), Landsat before that
+11. Never choose a dataset whose title names a country or region other than the user's region.
+
+DATASET CHECK RULE (always): after choosing the collection, call the "Get GEE Dataset Info" tool with
+its exact ID. Then: use only band names it lists (precomputed_band, band_override); copy scale_factor /
+precomputed_scale from it; keep date_start and date_end inside its available period; set is_temporal=false
+when its type is "image". If it says the dataset is not found, is deprecated, or is a "table", pick another
+collection (search the catalog again) and check that one. For ANY single-variable request (rainfall,
+temperature, a land cover product, a gas, an index band, ...) always fill "precomputed_band" with the exact
+band to display, even when map_type is a thematic type such as PRECIPITATION or LANDCOVER.
 
 UNLISTED COLLECTION RULE: If the user's dataset is not a common sensor you already know well
 and is not in the Precomputed Band Registry, call the search_gee_catalog tool with descriptive
@@ -408,8 +491,6 @@ RGB Sentinel-2:
 
     with st.expander("Agent Decision", expanded=False):
         st.caption(params.get("notes", ""))
-        if apply_cloud_removal:
-            st.info("Cloud removal is enabled for this request.")
         st.json(params)
 
     try:
@@ -511,17 +592,31 @@ RGB Sentinel-2:
                 "lon_min": min(all_lons), "lon_max": max(all_lons),
                 "lat_min": min(all_lats), "lat_max": max(all_lats),
             }
-        except Exception:
-            geo_bounds = None
+        except Exception as e:
+            st.error(f"Could not work out the extent of **{ascii_label(region_name)}** ({e}). No map was generated.")
+            st.stop()
 
         # Outline drawn on the map: the same boundary the data is clipped to.
         boundary_geojson = None
         if uploaded_region_geojson is None and not region_is_bbox:
             boundary_geojson = BoundaryAgent.outline_geojson(region_geom, geo_bounds)
 
+        # ---------------- DATASET ----------------
+        # Two sources describe the dataset: the catalog record (scale, units,
+        # class names, coverage - official datasets only) and a live query of
+        # Earth Engine (the bands that really exist - any dataset).
         status_intro = st.status(f"Inspecting dataset `{cid}`", expanded=False)
+        meta = fetch_dataset_metadata(cid)
+        if meta and meta["type"] == "table":
+            status_intro.update(label=f"`{cid}` is a vector table, not imagery", state="error")
+            st.error(
+                f"`{cid}` ({meta['title']}) is a vector table dataset. Gee-Luma maps image datasets; "
+                "tables cannot be rendered yet. Try asking for an image dataset on the same theme."
+            )
+            st.stop()
         col_info = introspect_collection(cid)
-        n_bands = len(col_info["bands"])
+        bands = col_info["bands"]
+        n_bands = len(bands)
         if col_info["error"] or n_bands == 0:
             # The agent named a dataset that cannot be opened as imagery.
             # Continuing would only fail later with an unrelated-looking error.
@@ -532,57 +627,112 @@ RGB Sentinel-2:
                 "Try naming the dataset in your request, e.g. 'using ESA WorldCover' or 'using MODIS'."
             )
             st.stop()
+        dataset_title = meta["title"] if meta else cid
         status_intro.update(
-            label=f"Dataset: {n_bands} band{'s' if n_bands != 1 else ''} detected" + (" (static)" if col_info["is_static"] else ""),
+            label=f"Dataset: {ascii_label(dataset_title)} ({n_bands} band{'s' if n_bands != 1 else ''})",
             state="complete"
         )
-
-        # Show detected bands for unknown/unlisted collections
-        if cid not in DATASET_BAND_MAP and col_info["bands"]:
-            with st.expander(f"Detected bands in `{cid}`"):
-                st.write(col_info["bands"])
+        with st.expander("Dataset details"):
+            st.markdown(f"**ID:** `{cid}`")
+            if meta:
+                st.markdown(f"**Title:** {meta['title']}")
+                if meta["provider"]:
+                    st.markdown(f"**Provider:** {meta['provider']}")
+                if meta["date_start"]:
+                    st.markdown(f"**Coverage:** {meta['date_start']} to {meta['date_end']}"
+                                + (f" ({meta['cadence']})" if meta["cadence"] else ""))
+                if meta["gsd"]:
+                    st.markdown(f"**Native resolution:** {meta['gsd']:g} m")
+            else:
+                st.caption("Not in the official Earth Engine catalog - band details come from a live query only.")
+            st.markdown(f"**Bands:** `{', '.join(bands)}`")
 
         is_static  = resolve_is_static(cid, col_info, agent_is_temporal)
         cloud_prop = detect_cloud_prop(cid, col_info)
         band_map   = get_dataset_band_map(cid, band_override, col_info)
         scale_cfg  = get_scale_config(cid, agent_scale_f, agent_scale_o)
+        if cid not in DATASET_SENSOR and meta:
+            # Sensor without a built-in profile: the catalog's own scale factor
+            # for its spectral bands is more reliable than the agent's recollection.
+            for mapped_band in band_map.values():
+                band_meta = meta["bands"].get(mapped_band)
+                if band_meta and band_meta["scale"] is not None:
+                    scale_cfg = {"factor": float(band_meta["scale"]), "offset": float(band_meta["offset"] or 0.0)}
+                    break
 
-        lulc_class_values: list[int] = []
-        requested_lulc = (
-            map_type == "LANDCOVER"
-            or PRECOMPUTED_PALETTE_MAP.get(str(params.get("precomputed_band", "")), "").upper() == "LANDCOVER"
-        )
-        if requested_lulc:
-            lulc_class_values = detect_lulc_class_filter(user_prompt, cid)
-            if lulc_class_values:
-                filtered_labels = [
-                    LULC_CLASS_SCHEMAS.get(cid, {}).get(v, {}).get("label", str(v))
-                    for v in lulc_class_values
-                ]
-                st.info(f"Filtering LULC to class(es): **{', '.join(filtered_labels)}** "
-                        f"(values: {lulc_class_values})")
+        # ---------------- WHICH BAND ----------------
+        requested_band = str(params.get("precomputed_band") or "").strip()
+        if requested_band and requested_band not in bands:
+            by_lower = {b.lower(): b for b in bands}
+            if requested_band.lower() in by_lower:
+                requested_band = by_lower[requested_band.lower()]
+            elif map_type == "PRECOMPUTED":
+                st.error(
+                    f"The AI agent asked for band `{requested_band}`, which `{cid}` does not have. "
+                    f"No map was generated. Available bands: `{', '.join(bands)}`. "
+                    "Try naming the variable you want more specifically."
+                )
+                st.stop()
+            else:
+                requested_band = ""
 
-        cloud_mask_fn         = CLOUD_MASK_FUNCTIONS.get(cid)
-        cloud_removal_applied = apply_cloud_removal and (cloud_mask_fn is not None) and (not is_static)
+        # A thematic map type with an explicit band is drawn from that band, so
+        # any dataset on the theme works - not only the one the type was written for.
+        theme_key = None
+        if map_type in THEMATIC_MAP_TYPES and requested_band:
+            theme_key = map_type
+            map_type = "PRECOMPUTED"
+        if map_type == "PRECOMPUTED" and not requested_band:
+            default_vis = [v["bands"][0] for v in (meta or {}).get("visualizations", [])
+                           if len(v["bands"]) == 1 and v["bands"][0] in bands]
+            data_bands = [b for b in bands
+                          if not ((meta or {}).get("bands", {}).get(b) or {}).get("is_bitmask")]
+            requested_band = (default_vis or data_bands or bands)[0]
+            st.info(f"No band was specified - showing `{requested_band}`.")
+
+        # Categorical band (land cover and any other classified product)?
+        class_band = None
+        if map_type == "LANDCOVER":
+            for candidate in (requested_band, LULC_BAND_LUT.get(cid), first_categorical_band(meta), "Map"):
+                if candidate and candidate in bands:
+                    class_band = candidate
+                    break
+            class_band = class_band or bands[0]
+        elif map_type == "PRECOMPUTED":
+            band_meta = (meta or {}).get("bands", {}).get(requested_band) or {}
+            if band_meta.get("classes") or PRECOMPUTED_PALETTE_MAP.get(requested_band) == "LANDCOVER":
+                class_band = requested_band
+        is_categorical = class_band is not None
+        has_class_schema = is_categorical and register_stac_classes(cid, class_band, meta)
+
+        # ---------------- CLOUD MASKING ----------------
+        # Applied by default wherever a per-pixel method exists: an unmasked
+        # composite of optical imagery shows clouds and haze.
+        mask_method           = cloud_mask_method(cid)
+        cloud_removal_applied = (mask_method is not None) and (not is_static) and (not cloud_masking_declined)
+        cloud_mask_desc       = mask_method[1] if cloud_removal_applied else None
 
         # How the images in the period are combined. Categorical data must never
-        # be averaged, so land cover always uses the most common class.
+        # be averaged, so classified products always use the most common class.
         reducer_name = str(params.get("temporal_reducer") or "").lower()
         if reducer_name not in TEMPORAL_REDUCERS:
-            reducer_name = DEFAULT_REDUCER_BY_MAP_TYPE.get(map_type, "median")
-        if requested_lulc:
+            reducer_name = DEFAULT_REDUCER_BY_MAP_TYPE.get(theme_key or map_type, "median")
+        if is_categorical:
             reducer_name = "mode"
 
+        # Single-band maps only need that band. Selecting it first also avoids
+        # failures on collections whose band list changes from image to image.
+        single_band = class_band if is_categorical else (requested_band if map_type == "PRECOMPUTED" else None)
+
         status_col = st.status(f"Loading dataset `{cid}`", expanded=True)
+        period_note = None
 
         if is_static:
             try:
                 if col_info["is_image_collection"]:
                     static_col = ee.ImageCollection(cid).filterBounds(region_geom)
-                    if cid in LULC_BAND_LUT:
-                        # Some land cover collections add bands in later years;
-                        # mosaicking needs the same bands in every image.
-                        static_col = static_col.select(LULC_BAND_LUT[cid])
+                    if single_band:
+                        static_col = static_col.select(single_band)
                     img = static_col.mosaic()
                 else:
                     img = ee.Image(cid)
@@ -592,87 +742,169 @@ RGB Sentinel-2:
             if apply_cloud_removal:
                 st.info("Cloud removal is not applicable to static datasets - skipped.")
         else:
-            col = (ee.ImageCollection(cid)
-                   .filterDate(date_start, date_end)
-                   .filterBounds(region_geom))
+            base_col = ee.ImageCollection(cid).filterBounds(region_geom)
+            if "S1_GRD" in cid:
+                base_col = base_col.filter(ee.Filter.eq("instrumentMode", "IW"))
+            col = base_col.filterDate(date_start, date_end)
             if cloud_prop:
                 col = col.filter(ee.Filter.lt(cloud_prop, cloud_cover))
-            if "S1_GRD" in cid:
-                col = col.filter(ee.Filter.eq("instrumentMode", "IW"))
 
-            if apply_cloud_removal and cloud_mask_fn is None:
+            if apply_cloud_removal and mask_method is None:
                 st.warning(
                     f"Pixel-level cloud masking is not available for `{cid}`. "
-                    "Cloud filtering by scene percentage is still applied."
+                    + ("Cloud filtering by scene percentage is still applied." if cloud_prop else "")
                 )
             if cloud_removal_applied:
                 status_col.update(label=f"Applying pixel-level cloud mask for `{cid}`")
-                col = col.map(cloud_mask_fn)
+                col = apply_cloud_mask(col, cid)
 
             n_images = col.size().getInfo()
+            if n_images == 0 and base_col.filterDate(date_start, date_end).size().getInfo() == 0:
+                # The dataset has nothing at all in this period (typical for
+                # yearly products asked for "recent months"). Use its most
+                # recent release up to the end of the period, and say so.
+                latest_time = (base_col.filterDate("1900-01-01", date_end)
+                               .aggregate_max("system:time_start").getInfo())
+                if latest_time is not None:
+                    col = base_col.filter(ee.Filter.eq("system:time_start", latest_time))
+                    if cloud_removal_applied:
+                        col = apply_cloud_mask(col, cid)
+                    n_images = col.size().getInfo()
+                    latest_day = ee.Date(latest_time).format("YYYY-MM-dd").getInfo()
+                    period_note = (f"`{cid}` has no images between {date_start} and {date_end}; "
+                                   f"the most recent one before that ({latest_day}) is shown instead.")
+                    st.info(period_note)
+                    date_start = date_end = latest_day
             if n_images == 0:
                 st.error(
                     f"**No usable imagery found** for **{ascii_label(region_name)}** "
                     f"between {date_start} and {date_end}."
                 )
-                if apply_cloud_removal:
-                    st.warning(
-                        "This may be because cloud removal filtered out all scenes.\n"
-                        "- Expand the date range (e.g. 6-12 months)\n"
-                        "- Increase the cloud cover threshold in your query\n"
-                        "- Remove the cloud removal request\n"
-                        "- Switch to MODIS for more frequent coverage"
-                    )
-                else:
-                    st.warning("Try expanding the date range or raising the cloud cover threshold.")
+                hints = []
+                if base_col.size().getInfo() == 0:
+                    hints.append(f"`{cid}` ({ascii_label(dataset_title)}) has no images over this region at all - "
+                                 "it probably covers a different part of the world. Try naming another dataset.")
+                elif meta and meta["date_start"]:
+                    hints.append(f"`{cid}` covers {meta['date_start']} to {meta['date_end']}.")
+                if cloud_prop:
+                    hints.append(f"Scenes were limited to under {cloud_cover}% cloud - "
+                                 "widen the period or allow more cloud.")
+                st.warning(" ".join(hints) or "Try a different period.")
                 st.stop()
+            if single_band:
+                col = col.select(single_band)
             img = col.reduce(TEMPORAL_REDUCERS[reducer_name]()).rename(col.first().bandNames())
 
         status_col.update(
             label=(f"Dataset loaded ({n_images} image{'s' if n_images != 1 else ''}"
-                   + ("" if is_static else f", {reducer_name} composite") + ")"
+                   + ("" if is_static or n_images == 1 else f", {reducer_name} composite") + ")"
                    + (" - Cloud masked" if cloud_removal_applied else "")),
             state="complete"
         )
 
-        status_compute = st.status(f"Computing **{map_type}** ({index_name or 'none'})", expanded=True)
+        status_compute = st.status(f"Computing **{map_type}** ({index_name or class_band or requested_band or 'none'})", expanded=True)
 
-        if map_type == "PRECOMPUTED":
-            precomputed_band  = params.get("precomputed_band", "")
-            precomputed_scale = float(params.get("precomputed_scale", 1.0))
-            if not precomputed_band:
-                # Fall back to first available band
-                precomputed_band = col_info["bands"][0] if col_info["bands"] else ""
-                if precomputed_band:
-                    st.info(f"No precomputed_band specified - using first band: `{precomputed_band}`")
-            if not precomputed_band:
-                st.warning("No band to display for PRECOMPUTED mode.")
-                st.stop()
-            result_img = img.select(precomputed_band)
-            if precomputed_scale != 1.0:
-                result_img = result_img.multiply(precomputed_scale)
-            result_img = result_img.rename(precomputed_band)
-            palette_key = PRECOMPUTED_PALETTE_MAP.get(precomputed_band, precomputed_band.upper())
-            if palette_key == "LANDCOVER" and cid in LULC_CLASS_SCHEMAS:
-                lulc_class_values = lulc_classes_for_display(cid, lulc_class_values)
-                result_img = result_img.remap(
-                    lulc_class_values,
-                    list(range(len(lulc_class_values)))
-                ).rename("LANDCOVER")
-                vis_params = lulc_vis_for_classes(cid, lulc_class_values)
-                precomputed_band = "LANDCOVER"
+        # Admin and uploaded regions are cut out along their boundary. A
+        # bounding-box region (continent, basin) instead fills the map frame;
+        # cutting it to a lat/lon box would leave a wedge shape once projected.
+        def clip_to_region(image):
+            return image if region_is_bbox else image.clip(region_geom)
+
+        lulc_legend: list | None = None
+        auto_range = False          # stretch the colour range to the data in this region?
+
+        if is_categorical:
+            class_img = img.select(class_band)
+            class_meta = (meta or {}).get("bands", {}).get(class_band) or {}
+            display_label = MAP_TYPE_TITLES["LANDCOVER"] if map_type == "LANDCOVER" else \
+                (band_display_label(meta, class_band) if class_meta else class_band)
+            title_label = display_label
+            if has_class_schema:
+                lulc_class_values = detect_lulc_class_filter(user_prompt, cid) if map_type == "LANDCOVER" else []
+                if lulc_class_values:
+                    st.info("Showing only: **" + ", ".join(
+                        LULC_CLASS_SCHEMAS[cid][v]["label"] for v in lulc_class_values) + "**")
+                else:
+                    # Legend lists only the classes that occur in this region.
+                    try:
+                        hist = class_img.reduceRegion(
+                            reducer=ee.Reducer.frequencyHistogram(), geometry=region_geom,
+                            scale=max(float((meta or {}).get("gsd") or 100), 100),
+                            bestEffort=True, maxPixels=1e9,
+                        ).get(class_band).getInfo() or {}
+                        present = {int(float(k)) for k in hist}
+                        lulc_class_values = [v for v in LULC_CLASS_SCHEMAS[cid] if v in present]
+                    except Exception:
+                        lulc_class_values = []
+                display_classes = lulc_classes_for_display(cid, lulc_class_values)
+                result_img = class_img.remap(
+                    display_classes, list(range(len(display_classes)))).rename("LANDCOVER")
+                vis_params_gee = {k: v for k, v in lulc_vis_for_classes(cid, display_classes).items()
+                                  if k != "label"}
+                lulc_legend = build_lulc_class_legend(cid, display_classes)
             else:
-                vis_params = get_palette(palette_key)
-            # For bands not in any known palette, auto-range from data
-            if palette_key not in INDEX_PALETTES and palette_key != "LANDCOVER":
-                auto = auto_vis_params(result_img, precomputed_band, region_geom)
-                vis_params = {**INDEX_PALETTES["SPYNDEX_GENERIC"],
-                              "min": auto["min"], "max": auto["max"],
-                              "label": precomputed_band}
+                # No published class list (community dataset): colour by value
+                # and label the classes by their numbers.
+                result_img = class_img.rename("LANDCOVER")
+                rng = auto_vis_params(result_img, "LANDCOVER", region_geom, percentile=0)
+                vis_params_gee = {"min": rng["min"], "max": rng["max"], "bands": ["LANDCOVER"],
+                                  "palette": INDEX_PALETTES["LANDCOVER"]["palette"]}
+                lulc_legend = generic_discrete_legend(
+                    clip_to_region(result_img), "LANDCOVER", region_geom,
+                    vis_params_gee["palette"], vis_params_gee["min"], vis_params_gee["max"]) or None
+                st.caption(f"`{cid}` publishes no class names - classes are labelled by their numeric value.")
+            final_img = clip_to_region(result_img)
+            map_label = "LANDCOVER" if map_type == "LANDCOVER" else class_band
+
+        elif map_type == "PRECOMPUTED":
+            band_meta = (meta or {}).get("bands", {}).get(requested_band) or {}
+            if band_meta.get("scale") is not None or band_meta.get("offset") is not None:
+                band_scale  = float(band_meta.get("scale") if band_meta.get("scale") is not None else 1.0)
+                band_offset = float(band_meta.get("offset") or 0.0)
+            else:
+                band_scale, band_offset = float(params.get("precomputed_scale") or 1.0), 0.0
+            result_img = img.select(requested_band)
+            if band_scale != 1.0:
+                result_img = result_img.multiply(band_scale)
+            if band_offset != 0.0:
+                result_img = result_img.add(band_offset)
+            result_img = result_img.rename(requested_band)
+
+            # Temperatures are published in kelvin; maps read better in Celsius.
+            band_units = band_meta.get("units", "")
+            if band_units in ("K", "Kelvin", "kelvin"):
+                result_img  = result_img.subtract(273.15).rename(requested_band)
+                band_units  = "deg C"
+
+            palette_key = (theme_key or PRECOMPUTED_PALETTE_MAP.get(requested_band)
+                           or (requested_band.upper() if requested_band.upper() in INDEX_PALETTES else None)
+                           or infer_theme(requested_band, band_meta.get("description", ""))
+                           or requested_band.upper())
+            themed = theme_key or (palette_key if palette_key in MAP_TYPE_TITLES else None)
+            if palette_key in INDEX_PALETTES:
+                vis_params = dict(INDEX_PALETTES[palette_key])
+                auto_range = palette_key not in FIXED_RANGE_KEYS
+                title_label = MAP_TYPE_TITLES.get(palette_key, vis_params["label"])
+            else:
+                vis_params = dict(INDEX_PALETTES["GENERIC"])
+                catalog_palette = stac_palette_for_band(meta, requested_band)
+                if catalog_palette:
+                    vis_params["palette"] = catalog_palette
+                auto_range = True
+                title_label = band_display_label(meta, requested_band).split(" (")[0] if band_meta else requested_band
+            # The palette's own label carries units that are only right for the
+            # dataset it was written for; prefer the catalog's description.
+            if band_meta and (auto_range or palette_key not in INDEX_PALETTES):
+                display_label = band_display_label(meta, requested_band).split(" (")[0]
+                if themed:
+                    display_label = MAP_TYPE_TITLES[themed]
+                if band_units:
+                    display_label = f"{display_label} ({band_units})"
+            else:
+                display_label = vis_params.get("label", requested_band)
             vis_params_gee = {k: v for k, v in vis_params.items() if k != "label"}
-            display_label  = vis_params.get("label", precomputed_band)
-            final_img      = result_img.clip(region_geom)
-            map_label      = precomputed_band
+            final_img      = clip_to_region(result_img)
+            map_label      = requested_band
 
         elif map_type == "SPYNDEX" and index_name:
             result_img = compute_spyndex_on_gee(
@@ -680,55 +912,93 @@ RGB Sentinel-2:
                 band_override=band_override or None
             )
             if result_img is None:
-                available = col_info.get("bands", [])
-                st.warning(
-                    f"Spyndex could not compute **{index_name}** for `{cid}`.\n"
-                    f"Available bands: `{available}`\n"
-                    "Check that the dataset has all required spectral bands."
+                st.error(
+                    f"**{index_name}** could not be computed from `{cid}`: the index is unknown or the "
+                    f"dataset lacks a band it needs. Available bands: `{', '.join(bands)}`. No map was generated."
                 )
                 st.stop()
             vis_params     = get_palette(index_name)
             vis_params_gee = {k: v for k, v in vis_params.items() if k != "label"}
             display_label  = vis_params.get("label", index_name)
-            final_img      = result_img.clip(region_geom)
+            auto_range     = index_name not in INDEX_PALETTES
+            long_name      = spyndex.indices[index_name].long_name if SPYNDEX_AVAILABLE and index_name in spyndex.indices else ""
+            title_label    = f"{long_name} ({index_name})" if long_name and len(long_name) < 48 else index_name
+            final_img      = clip_to_region(result_img)
             map_label      = index_name
 
         else:
             result_img, vis_params_raw = compute_special_map(
                 img, map_type, cid, band_map, scale_cfg,
-                lulc_class_values=lulc_class_values if map_type == "LANDCOVER" else None,
-                available_bands=col_info.get("bands"),
-                preferred_band=str(params.get("precomputed_band") or "") or None,
+                available_bands=bands,
+                preferred_band=requested_band or None,
             )
             display_label  = INDEX_PALETTES.get(map_type, {}).get("label", map_type)
+            title_label    = MAP_TYPE_TITLES.get(map_type, map_type)
             vis_params_gee = {k: v for k, v in vis_params_raw.items() if k != "label"}
-            final_img      = result_img.clip(region_geom)
+            auto_range     = "palette" in vis_params_gee and map_type not in FIXED_RANGE_KEYS
+            final_img      = clip_to_region(result_img)
             map_label      = map_type
 
-        # A total over the period has a different range from a single image,
-        # so the fixed per-image colour range is replaced by the data's own range.
-        if reducer_name == "sum" and not is_static and "palette" in vis_params_gee:
-            auto = auto_vis_params(final_img, map_label, region_geom)
+        is_rgb = "bands" in vis_params_gee and len(vis_params_gee["bands"]) == 3
+
+        # Fit the display range to the data in this region. Fixed ranges are kept
+        # only where the range is physically meaningful (indices, percentages).
+        if is_rgb:
+            stretch = auto_rgb_stretch(final_img, vis_params_gee["bands"], region_geom,
+                                       per_band=(map_type == "SAR_RGB"))
+            if stretch:
+                vis_params_gee["min"], vis_params_gee["max"] = stretch["min"], stretch["max"]
+        elif auto_range or (reducer_name == "sum" and not is_static and not is_categorical):
+            auto = auto_vis_params(final_img, vis_params_gee.get("bands", [map_label])[0], region_geom)
             if auto["max"] > auto["min"]:
                 vis_params_gee["min"], vis_params_gee["max"] = auto["min"], auto["max"]
-            display_label = "Total " + str(display_label).replace("(mm/day)", "(mm)")
+        if reducer_name == "sum" and not is_static and not is_categorical and n_images > 1:
+            display_label = "Total " + re.sub(r"\s*/\s*(d|day)\)", ")", str(display_label))
+            title_label   = "Total " + title_label[0].lower() + title_label[1:]
 
         # Apply sidebar palette override
         palette_override = palette_presets.get(selected_palette)
-        if palette_override and "palette" in vis_params_gee:
+        if palette_override and "palette" in vis_params_gee and not is_categorical:
             vis_params_gee["palette"] = palette_override
+
+        # The dataset must actually have data here: a regional dataset used
+        # outside its area, or a period with every pixel masked, would
+        # otherwise produce an empty map that looks like a result.
+        try:
+            first_band = final_img.bandNames().get(0)
+            valid_pixels = ee.Number(final_img.select([first_band]).reduceRegion(
+                reducer=ee.Reducer.count(), geometry=region_geom,
+                scale=max(float((meta or {}).get("gsd") or 30), 30),
+                bestEffort=True, maxPixels=1e6,
+            ).values().get(0)).getInfo()
+        except Exception:
+            valid_pixels = None     # could not check; let the render decide
+        if valid_pixels == 0:
+            status_compute.update(label="No data in this region", state="error")
+            st.error(
+                f"`{cid}` ({ascii_label(dataset_title)}) has **no data over {ascii_label(region_name)}**"
+                + ("" if is_static else f" between {date_start} and {date_end}")
+                + ". No map was generated. The dataset may cover a different part of the world, "
+                "or every pixel was masked (cloud). Try naming another dataset or a longer period."
+            )
+            st.stop()
 
         status_compute.update(label=f"{map_type} computed", state="complete")
 
-        status_thumb = st.status("Fetching map thumbnail", expanded=True)
-        map_pil, final_dim = fetch_thumbnail_with_retry(final_img, vis_params_gee, region_geom)
-        status_thumb.update(label=f"Thumbnail fetched at {final_dim}px", state="complete")
+        # ---------------- RENDER ----------------
+        projection = choose_map_projection(geo_bounds)
+        extent = projected_extent(projection, geo_bounds, uploaded_region_geojson or boundary_geojson)
+
+        status_thumb = st.status("Rendering map image on Earth Engine", expanded=True)
+        # Composites of many hundreds of images are too slow at full size.
+        target_px = 2048 if n_images <= 400 else 1024
+        map_pil, final_dim = fetch_thumbnail_with_retry(
+            final_img, vis_params_gee, extent, projection["crs"], target_long_side=target_px)
+        status_thumb.update(label=f"Map image rendered at {final_dim}px", state="complete")
 
         if cloud_removal_applied:
             engine_lbl = "Cloud masked"
-        elif apply_cloud_removal and not cloud_removal_applied:
-            engine_lbl = "Cloud filtered"
-        elif map_type == "PRECOMPUTED":
+        elif map_type == "PRECOMPUTED" or is_categorical:
             engine_lbl = "Precomputed"
         elif map_type == "SPYNDEX":
             engine_lbl = "Spyndex"
@@ -736,55 +1006,53 @@ RGB Sentinel-2:
             engine_lbl = "Built-in"
 
         status_render = st.status("Rendering cartographic layout", expanded=True)
-        is_rgb = "bands" in vis_params_gee and len(vis_params_gee["bands"]) == 3
 
-        # Build discrete LULC legend for the panel
-        lulc_legend: list | None = None
-        is_lulc_output = (
-            map_type == "LANDCOVER"
-            or map_label == "LANDCOVER"
-            or PRECOMPUTED_PALETTE_MAP.get(str(map_label), "").upper() == "LANDCOVER"
-        )
-        if is_lulc_output:
-            if lulc_class_values:
-                lulc_legend = build_lulc_class_legend(cid, lulc_class_values)
+        # Title, period line and credit block
+        if is_static:
+            if meta and meta["date_start"]:
+                y0, y1 = meta["date_start"][:4], meta["date_end"][:4]
+                # A period ending on 1 January belongs to the year before.
+                if meta["date_end"][5:10] == "01-01" and int(y1) > int(y0):
+                    y1 = str(int(y1) - 1)
+                subtitle = f"Dataset year {y0}" if y0 == y1 else f"Dataset period {y0} to {y1}"
             else:
-                lulc_legend = full_lulc_legend(cid) or None
-            if not lulc_legend:
-                # cid has no hardcoded class scheme in LULC_CLASS_SCHEMAS (e.g. a
-                # land-cover dataset found via the live catalog search rather than
-                # one of our registered ones). Build a discrete legend from the
-                # actual class values present in the AOI instead of silently
-                # falling back to a misleading continuous colorbar on categorical
-                # data.
-                lulc_legend = generic_discrete_legend(
-                    final_img, map_label, region_geom,
-                    vis_params_gee.get("palette", []),
-                    vis_params_gee.get("min", 0), vis_params_gee.get("max", 100),
-                ) or None
-                if lulc_legend:
-                    st.caption(
-                        f"`{cid}` isn't in the app's known LULC class registry - "
-                        "showing a generic per-value legend built from the classes "
-                        "actually present in this map."
-                    )
+                subtitle = None
+            processing = "Static dataset, no compositing"
+        elif date_start == date_end or n_images == 1:
+            subtitle = f"{date_start}" if date_start == date_end else f"{date_start} to {date_end}"
+            processing = f"Single image, {subtitle}"
+        else:
+            subtitle = f"{date_start} to {date_end} | {reducer_name} of {n_images} images"
+            processing = f"{reducer_name.capitalize()} composite of {n_images} images, {date_start} to {date_end}"
+        if cloud_removal_applied:
+            processing += f"; cloud masking: {cloud_mask_desc}"
+        if cloud_prop and not is_static:
+            processing += f"; scenes under {cloud_cover}% cloud"
+
+        credit_lines = [
+            f"Data: {dataset_title}" + (f" ({meta['provider']})" if meta and meta["provider"] else "")
+            + f" | Earth Engine ID: {cid}",
+            f"Processing: {processing}.",
+            f"Projection: {projection['name']}."
+            + (f" Native resolution: {meta['gsd']:g} m." if meta and meta["gsd"] else "")
+            + f" Map produced {date.today().isoformat()} with Gee-Luma on Google Earth Engine.",
+        ]
 
         png_bytes = render_cartographic_figure(
-            map_pil_image         = map_pil,
-            region_name           = region_name,
-            map_label             = map_label,
-            date_start            = date_start,
-            date_end              = date_end,
-            vis_params_gee        = vis_params_gee,
-            display_label         = display_label,
-            is_rgb                = is_rgb,
-            geo_bounds            = geo_bounds,
-            cloud_removal_applied = cloud_removal_applied,
-            lulc_legend           = lulc_legend,
-            region_geom           = region_geom,
-            uploaded_geojson      = uploaded_region_geojson,
-            custom_title          = map_title_override.strip() or None,
-            boundary_geojson      = boundary_geojson,
+            map_pil_image    = map_pil,
+            extent           = extent,
+            projection       = projection,
+            title            = map_title_override.strip() or f"{title_label} - {region_name}",
+            subtitle         = subtitle,
+            region_name      = region_name,
+            vis_params_gee   = vis_params_gee,
+            display_label    = display_label,
+            is_rgb           = is_rgb,
+            geo_bounds       = geo_bounds,
+            lulc_legend      = lulc_legend,
+            uploaded_geojson = uploaded_region_geojson,
+            boundary_geojson = boundary_geojson,
+            credit_lines     = credit_lines,
         )
         status_render.update(label="Cartographic layout rendered", state="complete")
 
@@ -801,7 +1069,7 @@ RGB Sentinel-2:
             "cloud_removal_applied": cloud_removal_applied,
             "file_name":  f"{ascii_label(map_label)}_{ascii_label(region_name).replace(' ','_')}_{date_start[:4]}{suffix}.png",
             "index_info": None,
-            "cloud_mask_fn": cloud_mask_fn.__name__ if cloud_removal_applied else None,
+            "cloud_mask_desc": cloud_mask_desc,
         }
         if map_type == "SPYNDEX" and SPYNDEX_AVAILABLE and index_name in spyndex.indices:
             idx_info = spyndex.indices[index_name]
@@ -864,16 +1132,9 @@ if "last_result" in st.session_state:
             if info["band_override"]:
                 st.markdown(f"**Band mapping used:** `{info['band_override']}`")
 
-    if res["cloud_mask_fn"]:
+    if res["cloud_mask_desc"]:
         with st.expander("Cloud Removal Details"):
-            desc_map = {
-                "mask_s2_clouds":        "Sentinel-2 SR - QA60 bitmask (bits 10 and 11: opaque and cirrus clouds)",
-                "mask_s2_toa_clouds":    "Sentinel-2 TOA - QA60 bitmask (bits 10 and 11: opaque and cirrus clouds)",
-                "mask_landsat_c2_clouds":"Landsat Collection 2 - QA_PIXEL bitmask (bit 3: cloud, bit 4: cloud shadow)",
-                "mask_modis_clouds":     "MODIS MOD09GA - state_1km QA band (bits 0-1: cloud state = clear)",
-                "mask_viirs_clouds":     "VIIRS VNP09GA - QF1 quality flag (bits 2-3: confident/probably clear)",
-            }
-            st.markdown(f"**Method:** {desc_map.get(res['cloud_mask_fn'], res['cloud_mask_fn'])}")
+            st.markdown(f"**Method:** {res['cloud_mask_desc']}")
             st.markdown(f"**Dataset:** `{res['collection']}`")
             st.markdown(
                 "Pixel-level cloud masking was applied before computing the composite. "

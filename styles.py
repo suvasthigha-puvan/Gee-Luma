@@ -783,7 +783,7 @@ GUIDANCE_HTML = """
   </div>
   <div class="el-cloud-tip">
     <div class="el-cloud-tip-dot"></div>
-    Append <strong>&ldquo;with cloud removal&rdquo;</strong> or <strong>&ldquo;cloud-free&rdquo;</strong> for pixel-level masking
+    Clouds are masked automatically for optical imagery &mdash; append <strong>&ldquo;keep clouds&rdquo;</strong> to turn masking off
   </div>
 </div>
 """
