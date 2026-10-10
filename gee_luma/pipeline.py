@@ -19,7 +19,7 @@ The `ui` object must provide:
 
 # ====================== COMPATIBILITY SHIMS ======================
 import warnings
-from utils import _make_warn_skip_file_prefixes_compatible, ascii_label
+from gee_luma.utils import _make_warn_skip_file_prefixes_compatible, ascii_label
 warnings.warn = _make_warn_skip_file_prefixes_compatible(warnings.warn)
 
 # ====================== STDLIB / THIRD-PARTY IMPORTS ======================
@@ -35,7 +35,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import textwrap
 from crewai import Agent, Task, Crew, LLM
-from catalog_search import search_gee_catalog_tool, recommended_for
+from gee_luma.catalog_search import search_gee_catalog_tool, recommended_for
 
 try:
     from pyproj import Transformer, CRS
@@ -70,11 +70,11 @@ from pathlib import Path
 
 KNOWLEDGE_BASE = Path(__file__).with_name("knowledge_base.md").read_text(encoding="utf-8")
 # ====================== LOCAL MODULE IMPORTS ======================
-from cloud_masking import (
+from gee_luma.cloud_masking import (
     user_wants_cloud_removal, user_declined_cloud_removal,
     cloud_mask_method, apply_cloud_mask,
 )
-from dataset_config import (
+from gee_luma.dataset_config import (
     COLLECTION_ALIASES, LULC_CLASS_SCHEMAS, LULC_BAND_LUT, DATASET_BAND_MAP, DATASET_SENSOR,
     register_stac_classes, register_detected_classes, first_categorical_band, auto_rgb_stretch,
     detect_lulc_class_filter, apply_lulc_class_filter,
@@ -84,25 +84,25 @@ from dataset_config import (
     get_scale_config, resolve_is_static, detect_cloud_prop,
     is_sar_collection, auto_vis_params,
 )
-from palettes import INDEX_PALETTES, PRECOMPUTED_PALETTE_MAP, get_palette
-from map_engine import compute_spyndex_on_gee, compute_special_map
-from cartography import render_cartographic_figure
-from projection import choose_map_projection, projected_extent
-from stac_metadata import (
+from gee_luma.palettes import INDEX_PALETTES, PRECOMPUTED_PALETTE_MAP, get_palette
+from gee_luma.map_engine import compute_spyndex_on_gee, compute_special_map
+from gee_luma.cartography import render_cartographic_figure
+from gee_luma.projection import choose_map_projection, projected_extent
+from gee_luma.stac_metadata import (
     fetch_dataset_metadata, get_dataset_info_tool,
     stac_palette_for_band, band_display_label,
 )
-from thumbnail import fetch_thumbnail_with_retry
-from geojson_helpers import (
+from gee_luma.thumbnail import fetch_thumbnail_with_retry
+from gee_luma.geojson_helpers import (
     _ensure_wgs84, geojson_to_ee_geometry,
     get_geojson_bounds, get_geojson_label,
 )
-from boundary_agent import BoundaryAgent
-from map_stats import continuous_stats, class_stats, stats_to_csv, format_value
-from class_legend import (
+from gee_luma.boundary_agent import BoundaryAgent
+from gee_luma.map_stats import continuous_stats, class_stats, stats_to_csv, format_value
+from gee_luma.class_legend import (
     is_class_candidate, distinct_values, snap_to_values, shorten_legend, MAX_DETECTED_CLASSES,
 )
-from exports import geotiff_download, fetch_geotiff
+from gee_luma.exports import geotiff_download, fetch_geotiff
 
 # Ways to combine the images of a period into one map.
 TEMPORAL_REDUCERS = {

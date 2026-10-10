@@ -27,8 +27,8 @@ import numpy as np
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-from utils import ascii_label
-from boundary_agent import draw_geojson_outline
+from gee_luma.utils import ascii_label
+from gee_luma.boundary_agent import draw_geojson_outline
 
 matplotlib.rcParams.update({"font.family": "DejaVu Sans"})
 

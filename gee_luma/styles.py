@@ -16,7 +16,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Master stylesheet
 # ---------------------------------------------------------------------------
-def _icon_data_uri(path: str = "icon.png") -> str:
+def _icon_data_uri(path: Path = Path(__file__).parent.parent / "assets" / "icon.png") -> str:
     p = Path(path)
     if not p.exists():
         return ""  # fall back gracefully

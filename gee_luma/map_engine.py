@@ -13,12 +13,12 @@ try:
 except ImportError:
     SPYNDEX_AVAILABLE = False
 
-from dataset_config import (
+from gee_luma.dataset_config import (
     SPYNDEX_VAR_ROLE, LULC_BAND_LUT,
     is_sar_collection, lulc_classes_for_display,
     apply_lulc_class_filter, lulc_vis_for_classes, auto_vis_params,
 )
-from palettes import get_palette, INDEX_PALETTES
+from gee_luma.palettes import get_palette, INDEX_PALETTES
 
 # ====================== SPYNDEX INDEX COMPUTATION ======================
 

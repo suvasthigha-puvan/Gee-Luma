@@ -6,6 +6,8 @@ processes it, and returns a print-ready cartographic map.
 Built with React, Starlette, CrewAI, Earth Engine and spyndex. A Streamlit version of the
 interface is included as well; both use the same pipeline.
 
+![The Gee-Luma interface](docs/screenshot.png)
+
 ## How it works
 
 1. **Agent** (CrewAI + GPT-4o-mini) reads the request and chooses the dataset, band,
@@ -25,29 +27,33 @@ interface is included as well; both use the same pipeline.
 ## Project structure
 
 ```
-gee-luma/
-├── pipeline.py          # The map pipeline, independent of any interface
-├── server.py            # Web API + host of the React interface
-├── frontend/            # React interface (Vite + TypeScript)
-├── app.py               # Streamlit interface (alternative to the web one)
-├── catalog_search.py    # Live Earth Engine catalog search (agent tool)
-├── stac_metadata.py     # Per-dataset metadata from the EE STAC catalog (agent tool)
-├── boundary_agent.py    # Place name -> admin boundary (geoBoundaries, any country)
-├── geojson_helpers.py   # Uploaded GeoJSON: reprojection + ee.Geometry conversion
-├── dataset_config.py    # Sensor band maps, class schemas, colour-range statistics
-├── cloud_masking.py     # Per-sensor cloud/shadow masking (Cloud Score+, QA bands)
-├── map_engine.py        # Index computation (spyndex) and composite map types
-├── palettes.py          # Colour palettes per index and theme
-├── projection.py        # Chooses a map projection for the region
-├── thumbnail.py         # Tiled, parallel high-resolution image fetch
-├── cartography.py       # Final map layout (PNG and PDF)
-├── class_legend.py      # Class legends for classified bands of any dataset
-├── map_stats.py         # Region statistics and CSV export
-├── exports.py           # GeoTIFF export of the data values
-├── styles.py            # Custom CSS and page header HTML
-├── utils.py             # Shared helpers
-├── knowledge_base.md    # Reference notes given to the agent
-└── requirements.txt
+Gee-Luma/
+├── server.py                # Start here: web API + host of the React interface
+├── app.py                   # Streamlit interface (alternative to the web one)
+├── requirements.txt
+├── .env.example             # Copy to .env and add your OpenAI key
+├── frontend/                # React interface (Vite + TypeScript)
+├── assets/                  # Logo
+├── docs/                    # Screenshots
+└── gee_luma/                # The map pipeline (Python package)
+    ├── pipeline.py          # The whole pipeline, independent of any interface
+    ├── catalog_search.py    # Live Earth Engine catalog search (agent tool)
+    ├── stac_metadata.py     # Per-dataset metadata from the EE STAC catalog (agent tool)
+    ├── knowledge_base.md    # Reference notes given to the agent
+    ├── boundary_agent.py    # Place name -> admin boundary (geoBoundaries, any country)
+    ├── geojson_helpers.py   # Uploaded GeoJSON: reprojection + ee.Geometry conversion
+    ├── dataset_config.py    # Sensor band maps, class schemas, colour-range statistics
+    ├── cloud_masking.py     # Per-sensor cloud/shadow masking (Cloud Score+, QA bands)
+    ├── map_engine.py        # Index computation (spyndex) and composite map types
+    ├── palettes.py          # Colour palettes per index and theme
+    ├── class_legend.py      # Class legends for classified bands of any dataset
+    ├── projection.py        # Chooses a map projection for the region
+    ├── thumbnail.py         # Tiled, parallel high-resolution image fetch
+    ├── cartography.py       # Final map layout (PNG and PDF)
+    ├── map_stats.py         # Region statistics and CSV export
+    ├── exports.py           # GeoTIFF export of the data values
+    ├── styles.py            # CSS and header HTML for the Streamlit page
+    └── utils.py             # Shared helpers
 ```
 
 ## Quick start
@@ -61,7 +67,7 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
 earthengine authenticate
-echo "OPENAI_API_KEY=sk-..." > .env
+cp .env.example .env       # then put your OpenAI key in it
 
 # Build the web interface once (needs Node.js 18+)
 cd frontend
@@ -75,7 +81,7 @@ python server.py            # http://localhost:8000
 
 The Streamlit interface still works: `streamlit run app.py`.
 
-Set `EE_PROJECT` to your own Earth Engine project ID (the default is in `pipeline.py`).
+Set `EE_PROJECT` to your own Earth Engine project ID (the default is in `gee_luma/pipeline.py`).
 
 ### Working on the interface
 

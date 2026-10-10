@@ -3,7 +3,7 @@ app.py
 ------
 Gee-Luma - Streamlit interface.
 
-The map pipeline itself lives in pipeline.py and is shared with the web
+The map pipeline itself lives in gee_luma/pipeline.py and is shared with the web
 interface (server.py + frontend/). This file is only the Streamlit page:
 inputs in, pipeline call, results out.
 
@@ -20,18 +20,18 @@ import ee
 import streamlit as st
 from dotenv import load_dotenv
 
-from pipeline import (
+from gee_luma.pipeline import (
     run_pipeline, render_original_map, create_llm,
     PALETTE_PRESETS, EE_PROJECT, SPYNDEX_AVAILABLE,
 )
-from utils import ascii_label
-from styles import (
+from gee_luma.utils import ascii_label
+from gee_luma.styles import (
     inject_css, SIDEBAR_WORDMARK, GUIDANCE_HTML,
     section_label, metric_card,
 )
-from geojson_helpers import _ensure_wgs84, get_geojson_bounds, get_geojson_label
-from map_stats import format_value
-from exports import fetch_geotiff
+from gee_luma.geojson_helpers import _ensure_wgs84, get_geojson_bounds, get_geojson_label
+from gee_luma.map_stats import format_value
+from gee_luma.exports import fetch_geotiff
 
 if SPYNDEX_AVAILABLE:
     import spyndex
@@ -53,7 +53,7 @@ def _stretch(widget) -> dict:
 
 
 # ====================== PAGE CONFIG ======================
-_page_icon_path = Path("icon.png")
+_page_icon_path = Path(__file__).parent / "assets" / "icon.png"
 PAGE_ICON = str(_page_icon_path) if _page_icon_path.exists() else "🛰️"
 
 st.set_page_config(

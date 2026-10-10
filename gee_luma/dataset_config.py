@@ -16,7 +16,7 @@ import re
 import ee
 import streamlit as st
 
-from class_legend import complete_class_colors, schema_from_values
+from gee_luma.class_legend import complete_class_colors, schema_from_values
 
 # ---------------------------------------------------------------------------
 # Spyndex variable -> spectral role

@@ -44,12 +44,12 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from pipeline import (
+from gee_luma.pipeline import (
     run_pipeline, render_original_map, create_llm,
     PALETTE_PRESETS, EE_PROJECT, LLM_MODEL, SPYNDEX_AVAILABLE,
 )
-from exports import fetch_geotiff
-from geojson_helpers import _ensure_wgs84, get_geojson_bounds, get_geojson_label
+from gee_luma.exports import fetch_geotiff
+from gee_luma.geojson_helpers import _ensure_wgs84, get_geojson_bounds, get_geojson_label
 
 FRONTEND_DIR = Path(__file__).with_name("frontend") / "dist"
 MAX_JOBS_KEPT = 12

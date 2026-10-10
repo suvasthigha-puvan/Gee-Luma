@@ -33,7 +33,7 @@ import requests
 import streamlit as st
 from crewai.tools import tool
 
-from class_legend import parse_classes_from_text
+from gee_luma.class_legend import parse_classes_from_text
 
 STAC_ROOT = "https://storage.googleapis.com/earthengine-stac/catalog"
 _FETCH_TIMEOUT = 15  # seconds
@@ -190,7 +190,7 @@ def get_dataset_info_tool(collection_id: str) -> str:
     if meta is None:
         # Not in the official catalog: fall back to asking Earth Engine directly.
         try:
-            from dataset_config import introspect_collection
+            from gee_luma.dataset_config import introspect_collection
             info = introspect_collection(cid)
         except Exception as exc:
             info = {"error": str(exc), "bands": []}
