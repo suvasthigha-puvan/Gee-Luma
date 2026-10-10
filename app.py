@@ -96,6 +96,8 @@ from geojson_helpers import (
     get_geojson_bounds, get_geojson_label,
 )
 from boundary_agent import BoundaryAgent
+from map_stats import continuous_stats, class_stats, stats_to_csv, format_value
+from exports import geotiff_download, fetch_geotiff
 
 # Ways to combine the images of a period into one map.
 TEMPORAL_REDUCERS = {
@@ -816,11 +818,17 @@ RGB Sentinel-2:
         if is_categorical:
             class_img = img.select(class_band)
             class_meta = (meta or {}).get("bands", {}).get(class_band) or {}
-            display_label = MAP_TYPE_TITLES["LANDCOVER"] if map_type == "LANDCOVER" else \
-                (band_display_label(meta, class_band) if class_meta else class_band)
+            # A land cover band is a land cover map however the agent labelled the request.
+            class_text = f"{class_band} {class_meta.get('description', '')}".lower().replace(" ", "")
+            is_landcover = (map_type == "LANDCOVER" or "landcover" in class_text or "landuse" in class_text
+                            or PRECOMPUTED_PALETTE_MAP.get(class_band) == "LANDCOVER")
+            if is_landcover:
+                display_label = MAP_TYPE_TITLES["LANDCOVER"]
+            else:
+                display_label = band_display_label(meta, class_band) if class_meta else class_band
             title_label = display_label
             if has_class_schema:
-                lulc_class_values = detect_lulc_class_filter(user_prompt, cid) if map_type == "LANDCOVER" else []
+                lulc_class_values = detect_lulc_class_filter(user_prompt, cid) if is_landcover else []
                 if lulc_class_values:
                     st.info("Showing only: **" + ", ".join(
                         LULC_CLASS_SCHEMAS[cid][v]["label"] for v in lulc_class_values) + "**")
@@ -854,7 +862,7 @@ RGB Sentinel-2:
                     vis_params_gee["palette"], vis_params_gee["min"], vis_params_gee["max"]) or None
                 st.caption(f"`{cid}` publishes no class names - classes are labelled by their numeric value.")
             final_img = clip_to_region(result_img)
-            map_label = "LANDCOVER" if map_type == "LANDCOVER" else class_band
+            map_label = "LANDCOVER" if is_landcover else class_band
 
         elif map_type == "PRECOMPUTED":
             band_meta = (meta or {}).get("bands", {}).get(requested_band) or {}
@@ -985,6 +993,47 @@ RGB Sentinel-2:
 
         status_compute.update(label=f"{map_type} computed", state="complete")
 
+        # ---------------- STATISTICS ----------------
+        # Computed from the same image that is drawn, so numbers and map agree.
+        stats, stats_lines = None, None
+        if not is_rgb:
+            status_stats = st.status("Computing statistics for the region", expanded=False)
+            stats_scale = max(float((meta or {}).get("gsd") or 30), 10)
+            if is_categorical:
+                # final_img holds legend positions (0, 1, 2, ...) when the dataset
+                # publishes its classes, otherwise the raw class values.
+                position_labels = ({i: LULC_CLASS_SCHEMAS[cid][v]["label"] for i, v in enumerate(display_classes)}
+                                   if has_class_schema else None)
+                class_filter_applied = has_class_schema and len(display_classes) < len(LULC_CLASS_SCHEMAS[cid]) \
+                    and bool(detect_lulc_class_filter(user_prompt, cid)) and is_landcover
+                stats = class_stats(final_img, "LANDCOVER", region_geom, position_labels, stats_scale,
+                                    share_of_region=class_filter_applied)
+                if stats:
+                    if has_class_schema:
+                        for row in stats["rows"]:
+                            row["value"] = display_classes[row["value"]]    # report the dataset's own codes
+                    share = {row["class"]: row["percent"] for row in stats["rows"]}
+                    for entry in (lulc_legend or []):
+                        pct = share.get(entry["label"])
+                        if pct is not None:
+                            entry["label"] += f" ({pct:.1f}%)" if pct >= 0.05 else " (<0.1%)"
+            else:
+                stats = continuous_stats(
+                    final_img, vis_params_gee.get("bands", [map_label])[0], region_geom,
+                    float(vis_params_gee.get("min", 0)), float(vis_params_gee.get("max", 1)), stats_scale)
+                if stats:
+                    s = dict(stats["rows"])
+                    stats_lines = [
+                        f"Mean {format_value(s.get('Mean'))}  |  Median {format_value(s.get('Median'))}",
+                        f"Min {format_value(s.get('Minimum'))}  |  Max {format_value(s.get('Maximum'))}",
+                        f"Std dev {format_value(s.get('Standard deviation'))}",
+                    ]
+            if stats and stats.get("area_km2") and stats_lines is not None:
+                stats_lines.append(f"Region area {stats['area_km2']:,.0f} km2")
+            status_stats.update(
+                label="Statistics computed" if stats else "Statistics could not be computed",
+                state="complete" if stats else "error")
+
         # ---------------- RENDER ----------------
         projection = choose_map_projection(geo_bounds)
         extent = projected_extent(projection, geo_bounds, uploaded_region_geojson or boundary_geojson)
@@ -1038,7 +1087,7 @@ RGB Sentinel-2:
             + f" Map produced {date.today().isoformat()} with Gee-Luma on Google Earth Engine.",
         ]
 
-        png_bytes = render_cartographic_figure(
+        rendered = render_cartographic_figure(
             map_pil_image    = map_pil,
             extent           = extent,
             projection       = projection,
@@ -1053,14 +1102,33 @@ RGB Sentinel-2:
             uploaded_geojson = uploaded_region_geojson,
             boundary_geojson = boundary_geojson,
             credit_lines     = credit_lines,
+            stats_lines      = stats_lines,
         )
         status_render.update(label="Cartographic layout rendered", state="complete")
+
+        # GeoTIFF of the data itself: real values (or the dataset's class
+        # codes), in the map projection. Only the link is prepared here; the
+        # file is downloaded when the user asks for it.
+        export_img = clip_to_region(class_img) if is_categorical else final_img.toFloat()
+        geotiff = geotiff_download(
+            export_img, extent, projection, n_bands=3 if is_rgb else 1,
+            native_scale_m=(meta or {}).get("gsd"),
+            lat_mid=(geo_bounds["lat_min"] + geo_bounds["lat_max"]) / 2.0)
 
         # Keep the finished map in the session: Streamlit reruns this script on
         # every click (including "Download"), and the map must survive that.
         suffix = "_cloudmasked" if cloud_removal_applied else ""
         result_data = {
-            "png_bytes":  png_bytes,
+            "png_bytes":  rendered["png"],
+            "pdf_bytes":  rendered["pdf"],
+            "stats":      stats,
+            "stats_csv":  stats_to_csv(stats, {
+                "Map": ascii_label(title_label), "Region": ascii_label(region_name),
+                "Dataset": f"{ascii_label(dataset_title)} ({cid})",
+                "Period": subtitle or "", "Values": ascii_label(display_label),
+            }) if stats else None,
+            "value_label": ascii_label(display_label),
+            "geotiff":    geotiff,
             "map_label":  ascii_label(map_label),
             "region":     ascii_label(region_name),
             "n_images":   n_images,
@@ -1117,8 +1185,73 @@ if "last_result" in st.session_state:
              caption=f"{res['map_label']} - {res['region']} - {res['collection']}{cloud_note}")
     st.success("Map generated successfully"
                + (" with pixel-level cloud masking applied." if res["cloud_removal_applied"] else "."))
-    st.download_button(label="Download Map PNG", data=res["png_bytes"],
-                       file_name=res["file_name"], mime="image/png")
+    base_name = res["file_name"].rsplit(".", 1)[0]
+    d1, d2, d3, d4 = st.columns(4)
+    with d1:
+        st.download_button(label="Download Map PNG", data=res["png_bytes"],
+                           file_name=f"{base_name}.png", mime="image/png", use_container_width=True)
+    with d2:
+        st.download_button(label="Download Map PDF", data=res["pdf_bytes"],
+                           file_name=f"{base_name}.pdf", mime="application/pdf", use_container_width=True)
+    with d3:
+        if res["stats_csv"]:
+            st.download_button(label="Download Statistics CSV", data=res["stats_csv"],
+                               file_name=f"{base_name}_statistics.csv", mime="text/csv",
+                               use_container_width=True)
+    with d4:
+        geotiff = res["geotiff"]
+        if geotiff and "bytes" in geotiff:
+            st.download_button(label="Download GeoTIFF", data=geotiff["bytes"],
+                               file_name=f"{base_name}.tif", mime="image/tiff", use_container_width=True)
+        elif geotiff:
+            # Fetched on request: the file can be tens of megabytes.
+            if st.button("Prepare GeoTIFF", use_container_width=True):
+                try:
+                    with st.spinner("Downloading GeoTIFF from Earth Engine..."):
+                        geotiff["bytes"] = fetch_geotiff(geotiff["url"])
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"GeoTIFF export failed: {e}")
+    if res["geotiff"]:
+        g = res["geotiff"]
+        st.caption(
+            f"GeoTIFF: data values at {g['scale_m']:g} m pixels in the map projection"
+            + (f" (resampled from the dataset's {g['native_scale_m']:g} m to fit Earth Engine's "
+               "download size limit)." if g["resampled"] else ".")
+        )
+
+    # ---------------- Statistics ----------------
+    stats = res["stats"]
+    if stats:
+        import pandas as pd
+        st.markdown(section_label("Statistics"), unsafe_allow_html=True)
+        if stats.get("area_km2"):
+            st.caption(f"Region area: {stats['area_km2']:,.0f} km2")
+        if stats["kind"] == "categorical":
+            table = pd.DataFrame([
+                {"Class": r["class"], "Area (km2)": round(r["area_km2"], 2), "Share (%)": round(r["percent"], 2)}
+                for r in stats["rows"]
+            ])
+            t1, t2 = st.columns([1, 1])
+            with t1:
+                st.dataframe(table, hide_index=True, use_container_width=True)
+            with t2:
+                st.bar_chart(table.set_index("Class")["Share (%)"])
+        else:
+            table = pd.DataFrame([{"Statistic": name, res["value_label"]: format_value(value)}
+                                  for name, value in stats["rows"]])
+            t1, t2 = st.columns([1, 1])
+            with t1:
+                st.dataframe(table, hide_index=True, use_container_width=True)
+            with t2:
+                if stats["histogram"]:
+                    hist = pd.DataFrame({
+                        res["value_label"]: [float(format_value((b["from"] + b["to"]) / 2).replace(",", ""))
+                                             for b in stats["histogram"]],
+                        "Pixels": [b["pixels"] for b in stats["histogram"]],
+                    }).set_index(res["value_label"])
+                    st.bar_chart(hist)
+                    st.caption("Distribution of values across the region.")
 
     info = res["index_info"]
     if info:

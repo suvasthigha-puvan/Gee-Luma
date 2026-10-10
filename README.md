@@ -36,7 +36,9 @@ gee-luma/
 ├── palettes.py          # Colour palettes per index and theme
 ├── projection.py        # Chooses a map projection for the region
 ├── thumbnail.py         # Tiled, parallel high-resolution image fetch
-├── cartography.py       # Final map layout (PNG export)
+├── cartography.py       # Final map layout (PNG and PDF)
+├── map_stats.py         # Region statistics and CSV export
+├── exports.py           # GeoTIFF export of the data values
 ├── styles.py            # Custom CSS and page header HTML
 ├── utils.py             # Shared helpers
 ├── knowledge_base.md    # Reference notes given to the agent
@@ -88,6 +90,18 @@ Vector (table) datasets are not supported yet.
 - Credit block: dataset title and provider, Earth Engine ID, period, compositing
   method, cloud masking, projection, native resolution, production date
 - Optional custom title
+
+## Statistics and exports
+
+- **Statistics over the region**, computed from the same image that is drawn:
+  mean, median, min, max, standard deviation, percentiles and a histogram for
+  continuous maps; area and share per class for categorical maps. Shown in the app
+  and summarised on the map itself.
+- **PNG** (300 dpi) and **PDF** (vector text and lines) of the map layout
+- **CSV** of the statistics
+- **GeoTIFF** of the data values (real units or class codes) in the map projection.
+  Earth Engine caps direct downloads at about 48 MB, so large regions are exported
+  at a coarser pixel size than the dataset's native one; the app states the size used.
 
 ## Environment variables
 

@@ -7,7 +7,7 @@ side panel with north arrow, locator map and legend, and a credit block
 naming the data source, processing and projection.
 
 Public API:
-  render_cartographic_figure(...)  -> bytes (PNG)
+  render_cartographic_figure(...)  -> {"png": bytes, "pdf": bytes}
 """
 
 import io
@@ -154,6 +154,15 @@ def _fmt_tick(value: float, step: float) -> str:
     return f"{value:.{decimals}f}"
 
 
+def _draw_stats_block(ap, stats_lines, y_top):
+    """Short summary of the data over the region, under the legend."""
+    ap.text(0.5, y_top, "Over the region", ha='center', va='top', fontsize=7.2, weight='bold',
+            color=_TEXT_DARK, transform=ap.transAxes)
+    ap.text(0.5, y_top - 0.032, "\n".join(ascii_label(line) for line in stats_lines),
+            ha='center', va='top', fontsize=6.8, color=_TEXT_MUTED,
+            transform=ap.transAxes, linespacing=1.6)
+
+
 def _draw_colorbar_legend(ap, palette, vmin, vmax, label, y_top):
     """Continuous legend: label, colour ramp, and ticks at round values."""
     ap.text(0.5, y_top, "\n".join(textwrap.wrap(ascii_label(label), 30)[:3]),
@@ -238,6 +247,7 @@ def render_cartographic_figure(
     uploaded_geojson=None,
     boundary_geojson=None,
     credit_lines: list[str] | None = None,
+    stats_lines: list[str] | None = None,
 ):
     """
     Lay out the final map.
@@ -249,6 +259,10 @@ def render_cartographic_figure(
     lulc_legend:   [{label, color}] for categorical maps, else None
     boundary_geojson / uploaded_geojson: outline drawn over the data
     credit_lines:  text lines for the credit block under the map
+    stats_lines:   short summary statistics shown under a continuous legend
+
+    Returns {"png": bytes, "pdf": bytes}. The PDF keeps text and lines as
+    vectors, so it stays sharp at any print size.
     """
     xmin, xmax, ymin, ymax = extent
     aspect = (xmax - xmin) / max(ymax - ymin, 1e-9)
@@ -382,6 +396,8 @@ def render_cartographic_figure(
     else:
         _draw_colorbar_legend(ap, palette, float(vis_params_gee.get("min", 0)),
                               float(vis_params_gee.get("max", 1)), display_label, y)
+        if stats_lines:
+            _draw_stats_block(ap, stats_lines, y - 0.27)
 
     # -------------------------
     # CREDIT BLOCK
@@ -393,8 +409,10 @@ def render_cartographic_figure(
         fig.text(0.125, 0.055, "\n".join(wrapped), ha="left", va="top", fontsize=6.8,
                  color=_TEXT_MUTED, linespacing=1.5)
 
-    buf = io.BytesIO()
-    plt.savefig(buf, dpi=300, bbox_inches='tight', pad_inches=0.18)
+    outputs = {}
+    for fmt in ("png", "pdf"):
+        buf = io.BytesIO()
+        fig.savefig(buf, format=fmt, dpi=300, bbox_inches='tight', pad_inches=0.18)
+        outputs[fmt] = buf.getvalue()
     plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
+    return outputs
