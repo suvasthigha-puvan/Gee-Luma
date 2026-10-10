@@ -3,7 +3,8 @@
 Describe a map in plain English; Gee-Luma finds the dataset in Google Earth Engine,
 processes it, and returns a print-ready cartographic map.
 
-Built with Streamlit, CrewAI, Earth Engine and spyndex.
+Built with React, Starlette, CrewAI, Earth Engine and spyndex. A Streamlit version of the
+interface is included as well; both use the same pipeline.
 
 ## How it works
 
@@ -25,7 +26,10 @@ Built with Streamlit, CrewAI, Earth Engine and spyndex.
 
 ```
 gee-luma/
-├── app.py               # Streamlit entry point and request pipeline
+├── pipeline.py          # The map pipeline, independent of any interface
+├── server.py            # Web API + host of the React interface
+├── frontend/            # React interface (Vite + TypeScript)
+├── app.py               # Streamlit interface (alternative to the web one)
 ├── catalog_search.py    # Live Earth Engine catalog search (agent tool)
 ├── stac_metadata.py     # Per-dataset metadata from the EE STAC catalog (agent tool)
 ├── boundary_agent.py    # Place name -> admin boundary (geoBoundaries, any country)
@@ -58,11 +62,42 @@ pip install -r requirements.txt
 earthengine authenticate
 echo "OPENAI_API_KEY=sk-..." > .env
 
-streamlit run app.py
+# Build the web interface once (needs Node.js 18+)
+cd frontend
+npm install
+npm run build
+cd ..
+
+# Start Gee-Luma
+python server.py            # http://localhost:8000
 ```
 
-The Earth Engine project ID is set in `app.py` (`ee.Initialize(project=...)`); change it
-to your own project.
+The Streamlit interface still works: `streamlit run app.py`.
+
+Set `EE_PROJECT` to your own Earth Engine project ID (the default is in `pipeline.py`).
+
+### Working on the interface
+
+Run the API and the interface's dev server side by side; the dev server reloads on
+every change and forwards `/api` calls to the Python server:
+
+```bash
+python server.py            # terminal 1
+cd frontend && npm run dev  # terminal 2 -> http://localhost:5173
+```
+
+Run `npm run build` again to update what `server.py` serves.
+
+## The web interface
+
+- Compose on the left: request, optional title, palette, region upload, gap-fill switch
+- Live progress while the map is generated, step by step
+- Map viewer with zoom and pan, gap-filled / original switch, and PNG, PDF, CSV and
+  GeoTIFF downloads
+- Statistics with a histogram or class-area bars, plus source and method details
+- Light and dark themes; the open map stays in the address bar (`?map=...`), so a
+  refresh returns to it
+- Maps are kept in the server's memory for the session only
 
 ## What you can ask for
 
@@ -111,9 +146,12 @@ Vector (table) datasets are not supported yet.
 
 ## Environment variables
 
-| Variable         | Description                   |
-|------------------|-------------------------------|
-| `OPENAI_API_KEY` | Required for the CrewAI agent |
+| Variable         | Description                                             |
+|------------------|---------------------------------------------------------|
+| `OPENAI_API_KEY` | Required for the CrewAI agent                           |
+| `EE_PROJECT`     | Earth Engine project ID (optional)                      |
+| `GEE_LUMA_MODEL` | Agent model, default `openai/gpt-4o-mini` (optional)    |
+| `PORT`           | Port for `server.py`, default 8000 (optional)           |
 
 ## License
 
