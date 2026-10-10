@@ -16,7 +16,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Master stylesheet
 # ---------------------------------------------------------------------------
-def _icon_data_uri(path: str = "icon.png") -> str:
+def _icon_data_uri(path: Path = Path(__file__).parent.parent / "assets" / "icon.png") -> str:
     p = Path(path)
     if not p.exists():
         return ""  # fall back gracefully
@@ -783,7 +783,7 @@ GUIDANCE_HTML = """
   </div>
   <div class="el-cloud-tip">
     <div class="el-cloud-tip-dot"></div>
-    Append <strong>&ldquo;with cloud removal&rdquo;</strong> or <strong>&ldquo;cloud-free&rdquo;</strong> for pixel-level masking
+    Clouds are masked automatically for optical imagery &mdash; append <strong>&ldquo;keep clouds&rdquo;</strong> to turn masking off
   </div>
 </div>
 """

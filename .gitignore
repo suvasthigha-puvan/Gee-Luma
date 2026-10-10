@@ -31,3 +31,10 @@ Thumbs.db
 
 # Streamlit cache
 .streamlit/
+
+# Web interface (React)
+node_modules/
+frontend/dist/
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
