@@ -28,6 +28,11 @@ import ee
 # resolution so that at most this many pixels are read (bestEffort).
 _MAX_PIXELS = 1e7
 _HISTOGRAM_BINS = 20
+# Percentiles are computed exactly from at most this many pixels. Earth
+# Engine's default percentile is approximate (values are binned first), and a
+# few extreme pixels stretch the bins so far that every percentile comes out
+# the same.
+_EXACT_PERCENTILE_PIXELS = 1_000_000
 
 
 def _region_area_km2(region_geom) -> ee.Number:
@@ -48,11 +53,17 @@ def continuous_stats(img: ee.Image, band: str, region_geom, vmin: float, vmax: f
         reducer = (ee.Reducer.mean()
                    .combine(ee.Reducer.minMax(), sharedInputs=True)
                    .combine(ee.Reducer.stdDev(), sharedInputs=True)
-                   .combine(ee.Reducer.percentile([10, 50, 90]), sharedInputs=True)
                    .combine(ee.Reducer.count(), sharedInputs=True))
         kwargs = dict(geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_MAX_PIXELS)
         request = {
             "stats": image.reduceRegion(reducer=reducer, **kwargs),
+            "percentiles": image.reduceRegion(
+                reducer=ee.Reducer.percentile([10, 50, 90], maxRaw=_EXACT_PERCENTILE_PIXELS),
+                geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_EXACT_PERCENTILE_PIXELS),
+            # Area that actually has data (not masked by cloud or missing).
+            "valid_km2": ee.Number(
+                ee.Image.pixelArea().updateMask(image.mask()).rename("area")
+                .reduceRegion(reducer=ee.Reducer.sum(), **kwargs).get("area")).divide(1e6),
             "area_km2": _region_area_km2(region_geom),
         }
         if vmax > vmin:
@@ -63,9 +74,12 @@ def continuous_stats(img: ee.Image, band: str, region_geom, vmin: float, vmax: f
         print(f"Statistics failed: {e}")
         return None
 
-    raw = result.get("stats") or {}
+    raw = {**(result.get("stats") or {}), **(result.get("percentiles") or {})}
     if raw.get(f"{band}_mean") is None:
         return None
+    coverage = None
+    if result.get("valid_km2") is not None and result.get("area_km2"):
+        coverage = min(100.0, 100.0 * result["valid_km2"] / result["area_km2"])
     rows = [
         ("Mean", raw.get(f"{band}_mean")),
         ("Median", raw.get(f"{band}_p50")),
@@ -85,6 +99,7 @@ def continuous_stats(img: ee.Image, band: str, region_geom, vmin: float, vmax: f
         "rows": [(name, value) for name, value in rows if value is not None],
         "histogram": histogram,
         "area_km2": result.get("area_km2"),
+        "coverage_percent": coverage,
     }
 
 
@@ -169,6 +184,8 @@ def stats_to_csv(stats: dict, context: dict) -> str:
         writer.writerow([key, value])
     if stats.get("area_km2") is not None:
         writer.writerow(["Region area (km2)", f"{stats['area_km2']:.2f}"])
+    if stats.get("coverage_percent") is not None:
+        writer.writerow(["Region covered by valid data (%)", f"{stats['coverage_percent']:.1f}"])
     writer.writerow([])
 
     if stats["kind"] == "categorical":

@@ -36,20 +36,28 @@ def compute_spyndex_on_gee(img, cid, index_name, band_map, scale_cfg, band_overr
     sf, offset = scale_cfg["factor"], scale_cfg["offset"]
     sar = is_sar_collection(cid)
     expr_map = {}
+    def _prepared(band_name, var):
+        b = img.select(band_name)
+        if sar:
+            return b
+        b = b.multiply(sf).add(offset)
+        if var not in ("T1", "T2"):
+            # Surface reflectance cannot be negative, but atmospheric correction
+            # produces slightly negative values over water and deep shadow.
+            # Left in, they make ratio indices explode: with N + R close to
+            # zero, (N - R) / (N + R) reaches hundreds or thousands instead of
+            # staying within -1..1.
+            b = b.max(0)
+        return b
+
     for var in required:
         if band_override and var in band_override:
-            b = img.select(band_override[var])
-            if not sar:
-                b = b.multiply(sf).add(offset)
-            expr_map[var] = b
+            expr_map[var] = _prepared(band_override[var], var)
             continue
         # 2. Role-based lookup in band_map
         role = SPYNDEX_VAR_ROLE.get(var)
         if role and role in band_map:
-            b = img.select(band_map[role])
-            if not sar:
-                b = b.multiply(sf).add(offset)
-            expr_map[var] = b
+            expr_map[var] = _prepared(band_map[role], var)
             continue
         # 3. Spyndex constant
         if var in spyndex.constants:

@@ -1030,6 +1030,8 @@ RGB Sentinel-2:
                     ]
             if stats and stats.get("area_km2") and stats_lines is not None:
                 stats_lines.append(f"Region area {stats['area_km2']:,.0f} km2")
+                if stats.get("coverage_percent") is not None:
+                    stats_lines.append(f"Valid data over {stats['coverage_percent']:.0f}% of region")
             status_stats.update(
                 label="Statistics computed" if stats else "Statistics could not be computed",
                 state="complete" if stats else "error")
@@ -1227,6 +1229,14 @@ if "last_result" in st.session_state:
         st.markdown(section_label("Statistics"), unsafe_allow_html=True)
         if stats.get("area_km2"):
             st.caption(f"Region area: {stats['area_km2']:,.0f} km2")
+        coverage = stats.get("coverage_percent")
+        if coverage is not None:
+            st.caption(f"Valid data covers {coverage:.0f}% of the region; statistics describe that part only.")
+            if coverage < 60:
+                st.warning(
+                    f"Only {coverage:.0f}% of the region has data - the rest was masked (usually cloud) or is "
+                    "missing from the dataset. A longer period usually fills the gaps."
+                )
         if stats["kind"] == "categorical":
             table = pd.DataFrame([
                 {"Class": r["class"], "Area (km2)": round(r["area_km2"], 2), "Share (%)": round(r["percent"], 2)}

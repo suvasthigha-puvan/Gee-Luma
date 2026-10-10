@@ -271,7 +271,8 @@ def render_cartographic_figure(
     if aspect < 0.7:
         fig_size = (9.5, 13)
     elif aspect > 1.8:
-        fig_size = (15, 8.5)
+        # Wide regions need less height; keep enough for the side panel.
+        fig_size = (15, float(np.clip(15 * 0.6 / aspect + 3.4, 7.2, 8.5)))
     else:
         fig_size = (12.5, 9.5)
 
