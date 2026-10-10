@@ -112,14 +112,20 @@ function ClassStats({ stats }: { stats: CategoricalStats }) {
         {stats.rows.map((r) => (
           <li key={r.value}>
             <div className="class-row">
-              <span className="class-name">{r.class}</span>
+              <span className="class-name">
+                {r.color && <span className="class-swatch" style={{ background: r.color }} aria-hidden="true" />}
+                {r.class}
+              </span>
               <span className="class-figures">
                 <span className="class-area">{formatArea(r.area_km2)}</span>
                 <span className="class-percent">{r.percent >= 0.05 ? `${r.percent.toFixed(1)}%` : "<0.1%"}</span>
               </span>
             </div>
             <div className="class-track">
-              <div className="class-fill" style={{ width: `${Math.max((r.percent / max) * 100, 0.5)}%` }} />
+              <div
+                className="class-fill"
+                style={{ width: `${Math.max((r.percent / max) * 100, 0.5)}%`, background: r.color }}
+              />
             </div>
           </li>
         ))}

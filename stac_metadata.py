@@ -33,6 +33,8 @@ import requests
 import streamlit as st
 from crewai.tools import tool
 
+from class_legend import parse_classes_from_text
+
 STAC_ROOT = "https://storage.googleapis.com/earthengine-stac/catalog"
 _FETCH_TIMEOUT = 15  # seconds
 
@@ -63,12 +65,19 @@ def _parse_band(raw: dict) -> dict:
         {
             "value": c.get("value"),
             "label": _short_label(c.get("description", c.get("value"))),
-            "color": "#" + str(c.get("color", "888888")).lstrip("#"),
+            # Not every dataset publishes colours; the legend assigns them then.
+            "color": ("#" + str(c["color"]).lstrip("#")) if c.get("color") else None,
         }
         for c in raw.get("gee:classes", [])
         if c.get("value") is not None
     ]
+    # Some datasets only write their classes out in the description text.
+    text_classes = []
+    if not classes and "gee:bitmask" not in raw:
+        text_classes = [{"value": c["value"], "label": _short_label(c["label"])}
+                        for c in parse_classes_from_text(raw.get("description", ""))]
     return {
+        "text_classes": text_classes,
         "name": raw.get("name", ""),
         "description": _clean_text(raw.get("description", "")),
         "units": _clean_text(raw.get("gee:units", "")).replace("^", ""),

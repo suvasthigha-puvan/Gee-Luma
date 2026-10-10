@@ -48,6 +48,8 @@ export interface ContinuousStats {
 export interface ClassRow {
   value: number;
   class: string;
+  /** The class's colour on the map, when the class has one. */
+  color?: string;
   area_km2: number;
   percent: number;
 }

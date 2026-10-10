@@ -1522,6 +1522,16 @@ kbd {
   white-space: nowrap;
 }
 
+.class-swatch {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong, rgba(0, 0, 0, 0.25));
+  vertical-align: -1px;
+}
+
 .class-figures {
   flex: none;
   display: flex;

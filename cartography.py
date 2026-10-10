@@ -131,6 +131,11 @@ def _draw_class_legend(ap, classes, title, y_top, y_bottom=0.03):
     font_size = 7 if row_h >= 0.028 else (6 if row_h >= 0.02 else 5)
     for i, item in enumerate(classes):
         y_row = y_first - i * row_h
+        if not item.get("color"):
+            # Closing line that sums up the classes left out of a long legend.
+            ap.text(0.08, y_row, ascii_label(item["label"]), ha='left', va='center',
+                    fontsize=font_size, style='italic', color=_TEXT_MUTED, transform=ap.transAxes)
+            continue
         ap.add_patch(mpatches.Rectangle(
             (0.08, y_row - row_h * 0.36), 0.08, row_h * 0.72,
             facecolor=item["color"], edgecolor="#333", lw=0.5,

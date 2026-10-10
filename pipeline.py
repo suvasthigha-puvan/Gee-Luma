@@ -76,7 +76,7 @@ from cloud_masking import (
 )
 from dataset_config import (
     COLLECTION_ALIASES, LULC_CLASS_SCHEMAS, LULC_BAND_LUT, DATASET_BAND_MAP, DATASET_SENSOR,
-    register_stac_classes, first_categorical_band, auto_rgb_stretch,
+    register_stac_classes, register_detected_classes, first_categorical_band, auto_rgb_stretch,
     detect_lulc_class_filter, apply_lulc_class_filter,
     build_lulc_class_legend, full_lulc_legend, generic_discrete_legend,
     lulc_classes_for_display, lulc_vis_for_classes,
@@ -99,6 +99,9 @@ from geojson_helpers import (
 )
 from boundary_agent import BoundaryAgent
 from map_stats import continuous_stats, class_stats, stats_to_csv, format_value
+from class_legend import (
+    is_class_candidate, distinct_values, snap_to_values, shorten_legend, MAX_DETECTED_CLASSES,
+)
 from exports import geotiff_download, fetch_geotiff
 
 # Ways to combine the images of a period into one map.
@@ -615,8 +618,26 @@ RGB Sentinel-2:
             band_meta = (meta or {}).get("bands", {}).get(requested_band) or {}
             if band_meta.get("classes") or PRECOMPUTED_PALETTE_MAP.get(requested_band) == "LANDCOVER":
                 class_band = requested_band
+            elif is_class_candidate(band_meta, (col_info.get("band_types") or {}).get(requested_band),
+                                    requested_band):
+                # The catalog lists no classes for this band, but it may still
+                # be a classification (mask, flag, class codes). The data
+                # decides: a handful of whole-number values means classes.
+                try:
+                    if col_info["is_image_collection"]:
+                        sample_col = ee.ImageCollection(cid).filterBounds(region_geom)
+                        if not is_static:
+                            sample_col = sample_col.filterDate(date_start, date_end)
+                        sample = sample_col.select(requested_band).mosaic()
+                    else:
+                        sample = ee.Image(cid)
+                    if distinct_values(sample, requested_band, region_geom, (meta or {}).get("gsd")):
+                        class_band = requested_band
+                except Exception:
+                    pass
         is_categorical = class_band is not None
         has_class_schema = is_categorical and register_stac_classes(cid, class_band, meta)
+        schema_key = cid          # where this band's classes are registered
 
         # ---------------- CLOUD MASKING ----------------
         # Applied by default wherever a per-pixel method exists: an unmasked
@@ -803,11 +824,32 @@ RGB Sentinel-2:
             else:
                 display_label = band_display_label(meta, class_band) if class_meta else class_band
             title_label = display_label
+            class_filter_applied = False
+            if not has_class_schema:
+                # No class list in the catalog: build one from the values in
+                # the data, named from the band description where it spells
+                # them out and by number otherwise.
+                found = distinct_values(class_img, class_band, region_geom, (meta or {}).get("gsd"),
+                                        max_classes=60 if is_landcover else MAX_DETECTED_CLASSES)
+                if found:
+                    schema_key = register_detected_classes(cid, class_band, found, class_meta.get("text_classes"))
+                    has_class_schema = True
+                    class_img = snap_to_values(class_img, found)
+                    if any(entry["label"] == f"Class {value}"
+                           for value, entry in LULC_CLASS_SCHEMAS[schema_key].items()):
+                        ui.caption(f"`{cid}` publishes no class names for `{class_band}` - "
+                                   "classes are labelled by their value.")
             if has_class_schema:
-                lulc_class_values = detect_lulc_class_filter(user_prompt, cid) if is_landcover else []
+                lulc_class_values = detect_lulc_class_filter(user_prompt, schema_key,
+                                                             require_only=not is_landcover)
                 if lulc_class_values:
+                    class_filter_applied = True
+                    if len(lulc_class_values) <= 2:
+                        # A map of one or two classes is titled after them.
+                        title_label = " and ".join(
+                            LULC_CLASS_SCHEMAS[schema_key][v]["label"] for v in lulc_class_values)
                     ui.info("Showing only: **" + ", ".join(
-                        LULC_CLASS_SCHEMAS[cid][v]["label"] for v in lulc_class_values) + "**")
+                        LULC_CLASS_SCHEMAS[schema_key][v]["label"] for v in lulc_class_values) + "**")
                 else:
                     # Legend lists only the classes that occur in this region.
                     try:
@@ -817,15 +859,15 @@ RGB Sentinel-2:
                             bestEffort=True, maxPixels=1e9,
                         ).get(class_band).getInfo() or {}
                         present = {int(float(k)) for k in hist}
-                        lulc_class_values = [v for v in LULC_CLASS_SCHEMAS[cid] if v in present]
+                        lulc_class_values = [v for v in LULC_CLASS_SCHEMAS[schema_key] if v in present]
                     except Exception:
                         lulc_class_values = []
-                display_classes = lulc_classes_for_display(cid, lulc_class_values)
+                display_classes = lulc_classes_for_display(schema_key, lulc_class_values)
                 result_img = class_img.remap(
                     display_classes, list(range(len(display_classes)))).rename("LANDCOVER")
-                vis_params_gee = {k: v for k, v in lulc_vis_for_classes(cid, display_classes).items()
+                vis_params_gee = {k: v for k, v in lulc_vis_for_classes(schema_key, display_classes).items()
                                   if k != "label"}
-                lulc_legend = build_lulc_class_legend(cid, display_classes)
+                lulc_legend = build_lulc_class_legend(schema_key, display_classes)
             else:
                 # No published class list (community dataset): colour by value
                 # and label the classes by their numbers.
@@ -971,7 +1013,7 @@ RGB Sentinel-2:
 
         # ---------------- STATISTICS ----------------
         # Computed from the same image that is drawn, so numbers and map agree.
-        stats, stats_lines = None, None
+        stats, stats_lines, class_shares = None, None, None
         legend_without_shares = [dict(entry) for entry in lulc_legend] if lulc_legend else None
         if not is_rgb:
             status_stats = ui.status("Computing statistics for the region", expanded=False)
@@ -979,19 +1021,18 @@ RGB Sentinel-2:
             if is_categorical:
                 # final_img holds legend positions (0, 1, 2, ...) when the dataset
                 # publishes its classes, otherwise the raw class values.
-                position_labels = ({i: LULC_CLASS_SCHEMAS[cid][v]["label"] for i, v in enumerate(display_classes)}
-                                   if has_class_schema else None)
-                class_filter_applied = has_class_schema and len(display_classes) < len(LULC_CLASS_SCHEMAS[cid]) \
-                    and bool(detect_lulc_class_filter(user_prompt, cid)) and is_landcover
+                position_labels = ({i: LULC_CLASS_SCHEMAS[schema_key][v]["label"]
+                                    for i, v in enumerate(display_classes)} if has_class_schema else None)
                 stats = class_stats(final_img, "LANDCOVER", region_geom, position_labels, stats_scale,
                                     share_of_region=class_filter_applied)
                 if stats:
                     if has_class_schema:
                         for row in stats["rows"]:
                             row["value"] = display_classes[row["value"]]    # report the dataset's own codes
-                    share = {row["class"]: row["percent"] for row in stats["rows"]}
+                            row["color"] = LULC_CLASS_SCHEMAS[schema_key][row["value"]]["color"]
+                    class_shares = {row["class"]: row["percent"] for row in stats["rows"]}
                     for entry in (lulc_legend or []):
-                        pct = share.get(entry["label"])
+                        pct = class_shares.get(entry["label"])
                         if pct is not None:
                             entry["label"] += f" ({pct:.1f}%)" if pct >= 0.05 else " (<0.1%)"
             else:
@@ -1014,6 +1055,12 @@ RGB Sentinel-2:
             status_stats.update(
                 label="Statistics computed" if stats else "Statistics could not be computed",
                 state="complete" if stats else "error")
+
+        # A region with more classes than fit the legend panel lists the
+        # largest ones; the statistics table and CSV still hold every class.
+        if lulc_legend:
+            lulc_legend = shorten_legend(lulc_legend, class_shares)
+            legend_without_shares = shorten_legend(legend_without_shares, class_shares)
 
         # ---------------- RENDER ----------------
         projection = choose_map_projection(geo_bounds)

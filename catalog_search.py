@@ -57,7 +57,9 @@ _FETCH_TIMEOUT = 15  # seconds
 # general request ("land cover of X") gets the standard product rather than
 # whichever regional or coarse dataset happens to match the words.
 RECOMMENDED_DATASETS: list[tuple[tuple[str, ...], str, str]] = [
-    (("land cover", "landcover", "land use", "lulc", "cropland", "farmland", "built-up area"), "ESA/WorldCover/v200", "ESA WorldCover 10m v200 (global land cover, 2021)"),
+    (("land cover", "landcover", "land use", "lulc", "cropland", "farmland", "built-up area",
+      "crop class", "crop area", "crop extent", "crop land", "crop cover", "agricultural land", "agriculture class",
+      "forest class", "water class", "urban class", "built-up class"),"ESA/WorldCover/v200", "ESA WorldCover 10m v200 (global land cover, 2021)"),
     (("elevation", "dem", "terrain", "slope", "hillshade", "aspect"), "USGS/SRTMGL1_003", "NASA SRTM Digital Elevation 30m"),
     (("rain", "rainfall", "precipitation"), "UCSB-CHG/CHIRPS/DAILY", "CHIRPS Daily Precipitation (global, 1981-present)"),
     (("land surface temperature", "lst"), "MODIS/061/MOD11A2", "MODIS Terra Land Surface Temperature 8-Day 1km"),
@@ -73,13 +75,30 @@ RECOMMENDED_DATASETS: list[tuple[tuple[str, ...], str, str]] = [
 ]
 
 
+# Names by which a request points at a particular dataset, sensor or provider.
+# A request that uses one is not answered with the standard dataset unless
+# the standard dataset is the one named.
+_DATASET_NAMES = (
+    "esa", "worldcover", "worldcereal", "world cereal", "corine", "modis", "mcd12", "dynamic world",
+    "copernicus", "proba", "nlcd", "globcover", "esri", "glad", "landsat", "sentinel", "mapbiomas",
+    "cgls", "usda", "cdl", "era5", "ecmwf", "gpm", "imerg", "trmm", "terraclimate", "chirps", "srtm",
+    "aster", "alos", "nasadem", "viirs", "dmsp", "worldpop", "ghsl", "gpw", "landscan", "jrc",
+    "hansen", "smap", "gldas", "daymet", "prism", "tropomi", "merit", "gedi", "noaa", "nasa", "usgs",
+    "jaxa", "fao", "openlandmap", "landfire", "glims", "cams", "persiann", "gsmap",
+)
+
+
 def recommended_for(text: str) -> list[tuple[str, str]]:
     """(id, title) of the standard datasets for every theme mentioned in `text`."""
     lower = text.lower()
+    named = [n for n in _DATASET_NAMES if re.search(r"\b" + re.escape(n) + r"\b", lower)]
     matches = []
     for phrases, rec_id, rec_title in RECOMMENDED_DATASETS:
         # Whole words only: "rain" must not match "rainforest".
         if any(re.search(r"\b" + re.escape(ph) + r"s?\b", lower) for ph in phrases):
+            target = f"{rec_id} {rec_title}".lower()
+            if named and not any(n in target for n in named):
+                continue        # the request names some other dataset
             matches.append((rec_id, rec_title))
     return matches
 

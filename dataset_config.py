@@ -11,8 +11,12 @@ Static lookup tables for GEE datasets:
   - LULC class schemas, keywords, and band lookup
 """
 
+import re
+
 import ee
 import streamlit as st
+
+from class_legend import complete_class_colors, schema_from_values
 
 # ---------------------------------------------------------------------------
 # Spyndex variable -> spectral role
@@ -245,16 +249,38 @@ _CLASS_THEME_WORDS: dict[str, list[str]] = {
 }
 
 
-def detect_lulc_class_filter(prompt: str, cid: str) -> list[int]:
-    """Parse user prompt for LULC class filter keywords. Returns class IDs or []."""
+_ONLY_WORDS = re.compile(r"\b(only|just|alone|solely|exclusively|extent|mask)\b")
+
+
+def detect_lulc_class_filter(prompt: str, cid: str, require_only: bool = False) -> list[int]:
+    """
+    Classes the request asks to single out ("crop class only", "forest extent"),
+    as class values of the schema registered under `cid`. Returns [] for a map
+    of all classes.
+
+    require_only: act only when the request says so explicitly ("only",
+    "just", "extent", ...). Used for classified products other than land
+    cover, where a theme word alone ("crop type map") does not mean a subset.
+    """
     lower = prompt.lower()
+    explicit = bool(_ONLY_WORDS.search(lower))
+    if require_only and not explicit:
+        return []
+    schema = LULC_CLASS_SCHEMAS.get(cid, {})
+    if explicit:
+        # A class named in full ("only evergreen broadleaf forest").
+        named = [value for value, entry in schema.items()
+                 if len(entry["label"]) >= 4
+                 and re.search(r"\b" + re.escape(entry["label"].lower()) + r"\b", lower)]
+        if named:
+            return named
     for keyword, dataset_map in LULC_CLASS_KEYWORDS.items():
         if keyword in lower:
             if cid in dataset_map:
                 return dataset_map[cid]
             # Dataset without a keyword table: match the theme against class names.
             words = _CLASS_THEME_WORDS.get(keyword, [keyword])
-            return [value for value, entry in LULC_CLASS_SCHEMAS.get(cid, {}).items()
+            return [value for value, entry in schema.items()
                     if any(w in entry["label"].lower() for w in words)]
     return []
 
@@ -272,11 +298,24 @@ def register_stac_classes(cid: str, band: str, meta: dict | None) -> bool:
     existing = LULC_CLASS_SCHEMAS.get(cid) if LULC_BAND_LUT.get(cid) == band else None
     if classes and (existing is None or len(classes) > len(existing)):
         LULC_CLASS_SCHEMAS[cid] = {
-            int(c["value"]): {"label": c["label"], "color": c["color"].upper()} for c in classes
+            int(c["value"]): {"label": c["label"], "color": c["color"].upper()}
+            for c in complete_class_colors(classes)      # some datasets publish no colours
         }
         LULC_BAND_LUT[cid] = band
         return True
     return existing is not None
+
+
+def register_detected_classes(cid: str, band: str, values: list[int], named_classes: list | None) -> str:
+    """
+    Register a class schema for a band whose classes the catalog does not
+    list: `values` are the values found in the data, `named_classes` any
+    names parsed from the band description. Returns the key the schema is
+    stored under (kept apart from the dataset's published schema).
+    """
+    key = f"{cid}::{band}"
+    LULC_CLASS_SCHEMAS[key] = schema_from_values(values, named_classes)
+    return key
 
 
 def first_categorical_band(meta: dict | None) -> str | None:
@@ -301,7 +340,7 @@ def apply_lulc_class_filter(img: ee.Image, lc_band: str, class_values: list[int]
 def build_lulc_class_legend(cid: str, class_values: list[int]) -> list[dict]:
     """Return [{label, color}] for the given class_values and collection."""
     schema = LULC_CLASS_SCHEMAS.get(cid, {})
-    legend = [{"label": schema[v]["label"], "color": schema[v]["color"]}
+    legend = [{"label": schema[v]["label"], "color": schema[v]["color"], "key": schema[v]["label"]}
               for v in class_values if v in schema]
     if not legend and class_values:
         legend.append({"label": f"Class {class_values}", "color": "#F096FF"})
@@ -406,7 +445,8 @@ def lulc_vis_for_classes(cid: str, class_values: list[int]) -> dict:
 @st.cache_data(ttl=3600, show_spinner=False)
 def introspect_collection(cid: str) -> dict:
     """Query GEE at runtime to determine band names, cloud property, and static/dynamic status."""
-    result = {"is_image_collection": True, "bands": [], "cloud_prop": None, "is_static": False, "error": None}
+    result = {"is_image_collection": True, "bands": [], "band_types": {}, "cloud_prop": None,
+              "is_static": False, "error": None}
     try:
         col  = ee.ImageCollection(cid).limit(2)
         size = col.size().getInfo()
@@ -415,6 +455,11 @@ def introspect_collection(cid: str) -> dict:
         first = col.first()
         result["is_image_collection"] = True
         result["bands"] = first.bandNames().getInfo()
+        try:
+            # Pixel type per band, e.g. {"precision": "int", "min": 0, "max": 255}
+            result["band_types"] = first.bandTypes().getInfo() or {}
+        except Exception:
+            pass
         props = first.propertyNames().getInfo()
         if "system:time_start" not in props:
             result["is_static"] = True
@@ -427,6 +472,10 @@ def introspect_collection(cid: str) -> dict:
         try:
             img = ee.Image(cid)
             result["bands"] = img.bandNames().getInfo()
+            try:
+                result["band_types"] = img.bandTypes().getInfo() or {}
+            except Exception:
+                pass
             result["is_image_collection"] = False
             result["is_static"] = True
         except Exception as exc:
