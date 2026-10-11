@@ -7,6 +7,7 @@ import { Welcome } from "./components/Welcome";
 import { Progress } from "./components/Progress";
 import { ResultView } from "./components/ResultView";
 import { Failure } from "./components/Failure";
+import { DatasetChoice } from "./components/DatasetChoice";
 
 const POLL_MS = 1500;
 
@@ -132,6 +133,16 @@ export default function App() {
     }
   };
 
+  const chooseDataset = async (id: string, dataset: string) => {
+    setSubmitError(null);
+    try {
+      await api.chooseDataset(id, dataset);
+      follow(id);
+    } catch (e) {
+      setSubmitError(e instanceof Error ? e.message : "The choice could not be sent.");
+    }
+  };
+
   const openJob = (id: string) => {
     setSubmitError(null);
     follow(id);
@@ -205,6 +216,9 @@ export default function App() {
 
           {!job && <Welcome meta={meta} onPick={setPrompt} />}
           {job && (job.status === "queued" || job.status === "running") && <Progress job={job} />}
+          {job && job.status === "choice" && job.choice && (
+            <DatasetChoice key={job.id} job={job} choice={job.choice} onChoose={(d) => chooseDataset(job.id, d)} />
+          )}
           {job && job.status === "error" && <Failure job={job} onRetry={generate} canRetry={!!prompt.trim()} />}
           {job && job.status === "done" && job.result && (
             <ResultView key={job.id} job={job} result={job.result} onJobChange={setJob} />

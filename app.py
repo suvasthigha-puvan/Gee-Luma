@@ -24,6 +24,7 @@ from gee_luma.pipeline import (
     run_pipeline, render_original_map, create_llm,
     PALETTE_PRESETS, EE_PROJECT, SPYNDEX_AVAILABLE,
 )
+from gee_luma.dataset_options import AUTO_CHOICE, option_summary
 from gee_luma.utils import ascii_label
 from gee_luma.styles import (
     inject_css, SIDEBAR_WORDMARK, GUIDANCE_HTML,
@@ -201,26 +202,67 @@ with col1:
     generate = st.button("GENERATE MAP", type="primary", **_stretch(st.button))
 
 # ====================== MAIN GENERATION LOGIC ======================
-if generate and user_prompt and "llm" in st.session_state:
-
+def run_request(request: dict, dataset: str = ""):
+    """Run the pipeline for `request` and keep what it returns for the sections below."""
     # A new request replaces the previous map, even if this one fails.
     st.session_state.pop("last_result", None)
+    st.session_state.pop("pending_choice", None)
 
-    result_data = run_pipeline(
-        user_prompt,
-        llm=st.session_state.llm,
-        ui=st,
-        uploaded_region_geojson=uploaded_region_geojson,
-        uploaded_region_label=uploaded_region_label,
-        map_title_override=map_title_override,
-        selected_palette=selected_palette,
-        fill_gaps_option=fill_gaps_option,
-    )
-    if result_data:
+    result_data = run_pipeline(request["prompt"], llm=st.session_state.llm, ui=st, dataset=dataset,
+                               **request["options"])
+    if result_data and result_data.get("dataset_options"):
+        # Several datasets fit: the request waits until one is picked below.
+        st.session_state["pending_choice"] = {"request": request, **result_data["dataset_options"]}
+    elif result_data:
         st.session_state["last_result"] = result_data
+
+
+if generate and user_prompt and "llm" in st.session_state:
+    run_request({
+        "prompt": user_prompt,
+        "options": {
+            "uploaded_region_geojson": uploaded_region_geojson,
+            "uploaded_region_label": uploaded_region_label,
+            "map_title_override": map_title_override,
+            "selected_palette": selected_palette,
+            "fill_gaps_option": fill_gaps_option,
+        },
+    })
 
 elif generate and "llm" not in st.session_state:
     st.warning("Please enter your OpenAI API key first.")
+
+# ====================== DATASET CHOICE ======================
+# A request such as "NDVI using MODIS" fits several datasets. Nothing is
+# processed until the person says which one they mean.
+if "pending_choice" in st.session_state:
+    pending = st.session_state["pending_choice"]
+    options = pending["options"]
+    choice_box = st.empty()
+    with choice_box.container():
+        st.markdown(section_label("Choose a dataset"), unsafe_allow_html=True)
+        st.info(
+            f"**{' '.join(filter(None, [str(len(options)), ascii_label(pending['named'])]))} datasets** "
+            "fit this request: "
+            f"*{pending['request']['prompt']}*\n\n"
+            "Pick the one to use - nothing has been processed yet."
+        )
+        picked = st.radio(
+            "Dataset",
+            range(len(options)),
+            format_func=lambda i: (f"{ascii_label(options[i]['title'])}  ({options[i]['id']})"
+                                   + ("  - standard choice" if options[i].get("standard") else "")),
+            captions=[" - ".join(t for t in (option_summary(o), ascii_label(o["note"])) if t) for o in options],
+            label_visibility="collapsed",
+        )
+        c1, c2, _c3 = st.columns([1.4, 1.4, 3])
+        with c1:
+            use_picked = st.button("USE THIS DATASET", type="primary", **_stretch(st.button))
+        with c2:
+            use_auto = st.button("Let Gee-Luma choose", **_stretch(st.button))
+    if use_picked or use_auto:
+        choice_box.empty()
+        run_request(pending["request"], dataset=AUTO_CHOICE if use_auto else options[picked]["id"])
 
 # ====================== MAP OUTPUT ======================
 # Rendered from session state so the map stays on screen across reruns.

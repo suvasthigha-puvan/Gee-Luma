@@ -143,7 +143,28 @@ export interface MapResult {
   agent: Record<string, unknown> | null;
 }
 
-export type JobStatus = "queued" | "running" | "done" | "error";
+/** One of the datasets a request could mean ("NDVI using MODIS" fits several). */
+export interface DatasetOption {
+  id: string;
+  title: string;
+  provider: string;
+  /** What sets this dataset apart from the other options. */
+  note: string;
+  resolution: string;
+  cadence: string;
+  coverage: string;
+  /** The dataset Gee-Luma uses for this theme when nobody chooses. */
+  standard?: boolean;
+}
+
+export interface DatasetChoice {
+  /** The dataset name as the request wrote it, e.g. "MODIS"; empty when it names none. */
+  named: string;
+  options: DatasetOption[];
+}
+
+/** "choice": the job waits for the person to pick a dataset before it processes anything. */
+export type JobStatus = "queued" | "running" | "choice" | "done" | "error";
 
 export interface JobSummary {
   id: string;
@@ -151,6 +172,8 @@ export interface JobSummary {
   prompt: string;
   created: number;
   elapsed: number;
+  /** Seconds the job spent waiting for a dataset choice (not counted in `elapsed`). */
+  waited?: number;
   error: string | null;
   title: string | null;
   region: string | null;
@@ -160,6 +183,7 @@ export interface Job extends JobSummary {
   steps: Step[];
   notes: Note[];
   result: MapResult | null;
+  choice?: DatasetChoice | null;
 }
 
 export interface RegionUpload {

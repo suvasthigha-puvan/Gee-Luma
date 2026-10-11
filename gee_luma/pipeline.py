@@ -40,6 +40,7 @@ from dotenv import load_dotenv
 import textwrap
 from crewai import Agent, Task, Crew, LLM
 from gee_luma.catalog_search import search_gee_catalog_tool, recommended_for
+from gee_luma.dataset_options import find_dataset_options, AUTO_CHOICE
 
 try:
     from pyproj import Transformer, CRS
@@ -287,14 +288,28 @@ def render_original_map(job: dict) -> dict:
 
 def run_pipeline(user_prompt: str, *, llm, ui, uploaded_region_geojson=None, uploaded_region_label=None,
                  map_title_override: str = "", selected_palette: str = "Auto (index-based)",
-                 fill_gaps_option: bool = True):
+                 fill_gaps_option: bool = True, dataset: str = ""):
     """
     Turn a plain-language request into a finished map.
 
     Returns the result dict (map PNG/PDF bytes, statistics, export details,
     description of what was done), or None if the request failed - in which
     case the reason has been reported through `ui.error`.
+
+    When several datasets fit the request - it names a family ("using MODIS")
+    or no dataset at all ("rainfall in Sri Lanka") - nothing is processed yet:
+    the return value is {"dataset_options": {"named": ..., "options": [...]}}
+    and the caller asks the person to pick one, then calls again with
+    `dataset` set to the chosen ID (or to AUTO_CHOICE to leave the choice to
+    the agent).
     """
+    dataset = (dataset or "").strip()
+    if not dataset:
+        with ui.spinner("Checking which datasets fit your request..."):
+            dataset_options = find_dataset_options(user_prompt, llm)
+        if dataset_options:
+            return {"dataset_options": dataset_options}
+    chosen_dataset = "" if dataset == AUTO_CHOICE else dataset
 
 
     apply_cloud_removal    = user_wants_cloud_removal(user_prompt)      # asked for explicitly
@@ -310,7 +325,13 @@ def run_pipeline(user_prompt: str, *, llm, ui, uploaded_region_geojson=None, upl
     # general request is not answered with an obscure or coarse dataset.
     recommended = recommended_for(user_prompt)
     recommended_note = ""
-    if recommended:
+    if chosen_dataset:
+        recommended_note = (
+            f"DATASET CHOSEN BY THE USER: {chosen_dataset}. The user picked this dataset from a list of "
+            "alternatives. Use exactly this collection ID - never substitute another dataset, whatever "
+            "the rules below say - and take the band names and scale factors from it.\n"
+        )
+    elif recommended:
         recommended_note = (
             "STANDARD DATASET for this request: "
             + "; ".join(f"{rec_id} ({rec_title})" for rec_id, rec_title in recommended)
@@ -489,6 +510,9 @@ RGB Sentinel-2:
         ui.stop()
 
     cid = COLLECTION_ALIASES.get(params["collection"], params["collection"])
+    if chosen_dataset and cid != chosen_dataset:
+        # The person's choice stands, even where the agent preferred another dataset.
+        cid = chosen_dataset
     params["collection"] = cid
 
     with ui.expander("Agent Decision", expanded=False):

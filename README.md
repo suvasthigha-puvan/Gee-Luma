@@ -38,6 +38,7 @@ Gee-Luma/
 └── gee_luma/                # The map pipeline (Python package)
     ├── pipeline.py          # The whole pipeline, independent of any interface
     ├── catalog_search.py    # Live Earth Engine catalog search (agent tool)
+    ├── dataset_options.py   # Datasets to choose from when several fit the request
     ├── stac_metadata.py     # Per-dataset metadata from the EE STAC catalog (agent tool)
     ├── knowledge_base.md    # Reference notes given to the agent
     ├── boundary_agent.py    # Place name -> admin boundary (geoBoundaries, any country)
@@ -110,9 +111,14 @@ Run `npm run build` again to update what `server.py` serves.
 
 ## What you can ask for
 
-- **Any image dataset in the Earth Engine catalog** — name it, or describe the theme
-  and the standard global dataset is used (ESA WorldCover for land cover, SRTM for
-  elevation, CHIRPS for rainfall, and so on)
+- **Any image dataset in the Earth Engine catalog** — name it exactly ("MOD13Q1"), name
+  a family ("using MODIS", "with Landsat 8"), or just describe the theme ("rainfall in
+  Sri Lanka")
+- **A choice of dataset** — when several datasets fit the request, Gee-Luma lists them
+  with resolution, update frequency and coverage and waits for you to pick one before
+  it processes anything. For a theme the standard global dataset (ESA WorldCover for
+  land cover, SRTM for elevation, CHIRPS for rainfall, and so on) is listed first and
+  marked; "Let Gee-Luma choose" uses it. Naming an exact product skips the question
 - **200+ spectral indices** via spyndex (NDVI, kNDVI, EVI, NBR, MNDWI, …)
 - **Colour composites**: true colour, false colour, SWIR, Sentinel-1 radar
 - **Categorical products**: land cover and any other classified band, with the

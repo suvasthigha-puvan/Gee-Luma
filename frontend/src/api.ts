@@ -44,6 +44,9 @@ export const api = {
 
   recent: () => call<{ jobs: JobSummary[] }>("/api/maps"),
 
+  chooseDataset: (id: string, dataset: string) =>
+    call<{ ok: true }>(`/api/maps/${id}/dataset`, postJson({ dataset })),
+
   renderOriginal: (id: string) => call<{ ok: true }>(`/api/maps/${id}/original`, { method: "POST" }),
 
   fileUrl: (id: string, name: string, download = false) =>

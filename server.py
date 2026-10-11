@@ -16,6 +16,7 @@ Endpoints
     POST /api/maps                       start a map job
     GET  /api/maps                       recent jobs
     GET  /api/maps/{id}                  job progress and result
+    POST /api/maps/{id}/dataset          continue a job that is waiting for a dataset choice
     POST /api/maps/{id}/original         render the original (not gap-filled) map
     GET  /api/maps/{id}/file/{name}      map.png, map.pdf, stats.csv, data.tif,
                                          original.png, original.pdf
@@ -48,6 +49,7 @@ from gee_luma.pipeline import (
     run_pipeline, render_original_map, create_llm,
     PALETTE_PRESETS, EE_PROJECT, LLM_MODEL, SPYNDEX_AVAILABLE,
 )
+from gee_luma.dataset_options import AUTO_CHOICE
 from gee_luma.exports import fetch_geotiff
 from gee_luma.geojson_helpers import _ensure_wgs84, get_geojson_bounds, get_geojson_label
 
@@ -165,7 +167,10 @@ class Job:
         self.request = request
         self.created = time.time()
         self.finished: float | None = None
-        self.status = "queued"            # queued | running | done | error
+        self.status = "queued"            # queued | running | choice | done | error
+        self.choice: dict | None = None   # datasets to pick from, while status is "choice"
+        self.paused_at: float | None = None
+        self.waited = 0.0                 # seconds spent waiting for the person's choice
         self.ui = RecordingUI()
         self.result: dict | None = None
         self.error: str | None = None
@@ -208,12 +213,21 @@ def _run_job(job: Job):
             map_title_override=req.get("title") or "",
             selected_palette=req.get("palette") or "Auto (index-based)",
             fill_gaps_option=bool(req.get("fill_gaps", True)),
+            dataset=req.get("dataset") or "",
         )
     except PipelineStop:
         job.result = None
     except Exception as e:          # anything the pipeline itself did not handle
         job.ui.error(f"Unexpected error: {e}")
         job.result = None
+
+    if job.result and job.result.get("dataset_options"):
+        # Several datasets fit the request: wait for the person to pick one.
+        job.choice, job.result = job.result["dataset_options"], None
+        job.paused_at = time.time()
+        job.status = "choice"
+        job.ui.close_open_steps("complete")
+        return
 
     if job.result:
         job.status = "done"
@@ -227,7 +241,8 @@ def _run_job(job: Job):
 
     # Results hold large images; keep only the most recent jobs.
     with JOBS_LOCK:
-        finished = sorted((j for j in JOBS.values() if j.finished), key=lambda j: j.created)
+        finished = sorted((j for j in JOBS.values() if j.finished or j.status == "choice"),
+                          key=lambda j: j.created)
         for old in finished[:-MAX_JOBS_KEPT]:
             JOBS.pop(old.id, None)
 
@@ -288,13 +303,16 @@ def _job_payload(job: Job, full: bool = True) -> dict:
         "status": job.status,
         "prompt": job.request["prompt"],
         "created": job.created,
-        "elapsed": round((job.finished or time.time()) - job.created, 1),
+        "elapsed": round((job.finished or (job.status == "choice" and job.paused_at) or time.time())
+                         - job.created - job.waited, 1),
+        "waited": round(job.waited, 1),
         "error": job.error,
         "title": (job.result or {}).get("title"),
         "region": (job.result or {}).get("region"),
     }
     if full:
-        payload.update({"steps": steps, "notes": notes, "result": _result_payload(job)})
+        payload.update({"steps": steps, "notes": notes, "result": _result_payload(job),
+                        "choice": job.choice if job.status == "choice" else None})
     return payload
 
 
@@ -378,6 +396,26 @@ def api_get_map(request: Request):
     return missing or JSONResponse(_job_payload(job))
 
 
+async def api_choose_dataset(request: Request):
+    job, missing = _job_or_404(request)
+    if missing:
+        return missing
+    try:
+        dataset = str((await request.json()).get("dataset") or "").strip()
+    except Exception:
+        return JSONResponse({"error": "The request body must be JSON."}, status_code=400)
+    with JOBS_LOCK:
+        if job.status != "choice":
+            return JSONResponse({"error": "This map is not waiting for a dataset choice."}, status_code=409)
+        if dataset != AUTO_CHOICE and dataset not in {o["id"] for o in job.choice["options"]}:
+            return JSONResponse({"error": "Pick one of the datasets offered."}, status_code=400)
+        job.request["dataset"] = dataset
+        job.waited += time.time() - (job.paused_at or time.time())
+        job.status = "queued"
+    WORKER.submit(_run_job, job)
+    return JSONResponse({"ok": True}, status_code=202)
+
+
 def api_render_original(request: Request):
     job, missing = _job_or_404(request)
     if missing:
@@ -438,6 +476,7 @@ routes = [
     Route("/api/maps", api_create_map, methods=["POST"]),
     Route("/api/maps", api_list_maps, methods=["GET"]),
     Route("/api/maps/{job_id}", api_get_map),
+    Route("/api/maps/{job_id}/dataset", api_choose_dataset, methods=["POST"]),
     Route("/api/maps/{job_id}/original", api_render_original, methods=["POST"]),
     Route("/api/maps/{job_id}/file/{name}", api_file),
 ]
