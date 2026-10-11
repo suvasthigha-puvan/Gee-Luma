@@ -105,6 +105,7 @@ from gee_luma.boundary_agent import BoundaryAgent
 from gee_luma.map_stats import (
     continuous_stats, class_stats, series_stats, series_class_stats, stats_to_csv, format_value,
 )
+from gee_luma.units import whole_period, relabel_units
 from gee_luma.time_series import (
     CLIMATOLOGIES, MAX_PANELS, normalise_series, infer_series_from_prompt, build_panels,
     series_title, series_subtitle, series_processing,
@@ -1195,9 +1196,20 @@ RGB Sentinel-2:
                     or auto_vis_params(final_img, value_band, region_geom))
             if auto["max"] > auto["min"]:
                 vis_params_gee["min"], vis_params_gee["max"] = auto["min"], auto["max"]
+        # Units of the legend. The dataset's units describe one image; a map
+        # of totals is per month, season or year (or simply the total of some
+        # other period), and water depths read in mm.
+        if not is_static and not is_categorical and not is_rgb:
+            if panels:
+                unit_period = {"monthly": "month", "monthly_climatology": "month", "seasonal": "season",
+                               "seasonal_climatology": "season", "annual": "year"}.get(series_kind)
+            else:
+                unit_period = whole_period(date_start, date_end)
+            display_label = relabel_units(
+                str(display_label), reducer_name if n_images > 1 else None, unit_period,
+                hint=f"{title_label} {map_label} {theme_key or ''}")
         if reducer_name == "sum" and not is_static and not is_categorical and n_images > 1:
-            # A total over a period is no longer "per day" or "per 8 days".
-            display_label = "Total " + re.sub(r"\s*/\s*(\d+\s*-?\s*)?(d|day|days|month)\)", ")", str(display_label))
+            display_label = "Total " + str(display_label)
             if not panels:
                 title_label = "Total " + title_label[0].lower() + title_label[1:]
             elif series_kind in CLIMATOLOGIES:

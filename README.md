@@ -50,6 +50,7 @@ Gee-Luma/
     ├── projection.py        # Chooses a map projection for the region
     ├── thumbnail.py         # Tiled, parallel high-resolution image fetch
     ├── time_series.py       # Splits a period into the maps of a multi-map figure
+    ├── units.py             # Legend units for totals and averages (mm/month, mm/year, ...)
     ├── cartography.py       # Final map layout, single and multi-map (PNG and PDF)
     ├── map_stats.py         # Region statistics and CSV export
     ├── exports.py           # GeoTIFF export of the data values
@@ -147,6 +148,11 @@ Ask for more than one period and the maps are drawn together, on one page:
   3 × 4, of a compact one 4 × 3.
 - **Comparable by construction**: every map has the same extent, projection and colour
   scale (fitted to all of them together), under one shared legend and scale bar.
+- **Units follow the aggregation**: monthly totals are in mm/month, seasonal in
+  mm/season, annual in mm/year, a total over any other period in mm; averages keep the
+  dataset's own rate (mm/day, mm/8 days). Rainfall and evapotranspiration published
+  in kg/m² are shown in mm (the same quantity). This applies to single maps too: a
+  total for one calendar year reads mm/year.
 - Whole calendar units are mapped: a period that covers less than half of a month,
   season or year does not get a map of it. A period still running ends today, and
   periods with no images are left out; both are reported.

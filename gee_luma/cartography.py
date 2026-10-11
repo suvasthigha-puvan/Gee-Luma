@@ -57,7 +57,7 @@ def _fmt_distance(km: float) -> str:
     return f"{km:,.0f} km" if km >= 1000 else f"{km:g} km"
 
 
-def _draw_map_scale_bar(map_ax, extent, projection, lat_mid, compact=False):
+def _draw_map_scale_bar(map_ax, extent, projection, lat_mid, compact=False, font_size=7):
     """
     Draw a scale bar in the lower-left corner of the map, in map coordinates,
     so its drawn length is the ground distance it is labelled with.
@@ -93,7 +93,7 @@ def _draw_map_scale_bar(map_ax, extent, projection, lat_mid, compact=False):
     if compact:
         del labels[1]
     for x, label in labels:
-        map_ax.text(x, y_text, label, ha="center", va="bottom", fontsize=7,
+        map_ax.text(x, y_text, label, ha="center", va="bottom", fontsize=font_size,
                     color=_TEXT_DARK, transform=crs, zorder=9, path_effects=halo)
 
 
@@ -439,8 +439,12 @@ def render_cartographic_figure(
 # box; the figure then grows around it for the title, legend and credits.
 _GRID_MAX_W, _GRID_MAX_H = 15.0, 9.6
 _CELL_MAX = 6.5         # no single map needs to be larger than this
-_LABEL_H = 0.27         # strip above each map for its label
-_GAP_X, _GAP_Y = 0.16, 0.13
+_LABEL_H = 0.36         # strip above each map for its label
+_GAP_X, _GAP_Y = 0.2, 0.16
+# Text sizes (points). The figure is a full page that is usually looked at
+# scaled down to a screen, so they are larger than on the single map.
+_FS_PANEL, _FS_PANEL_SMALL, _FS_NOTE = 11, 9.5, 8.5
+_FS_GRATICULE, _FS_LEGEND_TITLE, _FS_LEGEND, _FS_CREDIT = 8.5, 11.5, 9.5, 8.5
 
 
 def choose_grid_layout(n_maps: int, aspect: float) -> dict:
@@ -483,44 +487,45 @@ def _draw_strip_legend(lg, width, height, vis_params_gee, display_label, is_rgb,
     palette = vis_params_gee.get("palette")
     if lulc_legend:
         lg.text(width / 2, height - 0.05, ascii_label(display_label), ha="center", va="top",
-                fontsize=8.5, weight="bold", color=_TEXT_DARK)
+                fontsize=_FS_LEGEND_TITLE, weight="bold", color=_TEXT_DARK)
         n_cols, n_rows = _class_legend_grid(len(lulc_legend), width)
         col_w = width / n_cols
         for i, item in enumerate(lulc_legend):
             x = (i // n_rows) * col_w + 0.1
-            y = height - 0.42 - (i % n_rows) * 0.2
-            label = textwrap.shorten(ascii_label(item["label"]), int(col_w * 15), placeholder="...")
+            y = height - 0.52 - (i % n_rows) * 0.26
+            label = textwrap.shorten(ascii_label(item["label"]), int(col_w * 11), placeholder="...")
             if not item.get("color"):
-                lg.text(x, y, label, ha="left", va="center", fontsize=7, style="italic", color=_TEXT_MUTED)
+                lg.text(x, y, label, ha="left", va="center", fontsize=_FS_LEGEND, style="italic",
+                        color=_TEXT_MUTED)
                 continue
-            lg.add_patch(mpatches.Rectangle((x, y - 0.065), 0.2, 0.13, facecolor=item["color"],
+            lg.add_patch(mpatches.Rectangle((x, y - 0.08), 0.25, 0.16, facecolor=item["color"],
                                             edgecolor="#333", lw=0.5))
-            lg.text(x + 0.28, y, label, ha="left", va="center", fontsize=7, color=_TEXT_DARK)
+            lg.text(x + 0.35, y, label, ha="left", va="center", fontsize=_FS_LEGEND, color=_TEXT_DARK)
     elif is_rgb or not palette:
         bands = vis_params_gee.get("bands", [])
         channels = [("Red", "#d64545"), ("Green", "#3f9d4b"), ("Blue", "#3f6fd1")]
-        entry_w = min(2.2, width / 3)
+        entry_w = min(2.7, width / 3)
         x0 = (width - 3 * entry_w) / 2
         lg.text(width / 2, height - 0.05, "Colour composite", ha="center", va="top",
-                fontsize=8.5, weight="bold", color=_TEXT_DARK)
+                fontsize=_FS_LEGEND_TITLE, weight="bold", color=_TEXT_DARK)
         for i, (channel, colour) in enumerate(channels):
             band = bands[i] if i < len(bands) else channel
-            lg.add_patch(mpatches.Rectangle((x0 + i * entry_w, 0.1), 0.2, 0.13, facecolor=colour,
+            lg.add_patch(mpatches.Rectangle((x0 + i * entry_w, 0.1), 0.25, 0.16, facecolor=colour,
                                             edgecolor="#333", lw=0.5))
-            lg.text(x0 + i * entry_w + 0.28, 0.165, _CHANNEL_BAND_NAMES.get(band, str(band)),
-                    ha="left", va="center", fontsize=7, color=_TEXT_DARK)
+            lg.text(x0 + i * entry_w + 0.35, 0.18, _CHANNEL_BAND_NAMES.get(band, str(band)),
+                    ha="left", va="center", fontsize=_FS_LEGEND, color=_TEXT_DARK)
     else:
-        bar_w = min(6.0, width * 0.7)
+        bar_w = min(7.0, width * 0.7)
         lg.text(width / 2, height - 0.05, ascii_label(display_label), ha="center", va="top",
-                fontsize=8.5, weight="bold", color=_TEXT_DARK)
-        cax = lg.inset_axes([(width - bar_w) / 2, height - 0.5, bar_w, 0.17], transform=lg.transData)
+                fontsize=_FS_LEGEND_TITLE, weight="bold", color=_TEXT_DARK)
+        cax = lg.inset_axes([(width - bar_w) / 2, height - 0.6, bar_w, 0.2], transform=lg.transData)
         _fill_colorbar(cax, palette, float(vis_params_gee.get("min", 0)),
-                       float(vis_params_gee.get("max", 1)), tick_size=7)
+                       float(vis_params_gee.get("max", 1)), tick_size=_FS_LEGEND)
 
 
 def _class_legend_grid(n_classes: int, width: float) -> tuple[int, int]:
     """Columns and rows of a class legend laid out across `width` inches."""
-    n_cols = int(max(1, min(n_classes, width // 2.3)))
+    n_cols = int(max(1, min(n_classes, width // 3.0)))
     return n_cols, int(np.ceil(n_classes / n_cols))
 
 
@@ -557,8 +562,8 @@ def render_composite_figure(
     cell_w, cell_h = layout["cell_w"], layout["cell_h"]
     lat_mid = (geo_bounds["lat_min"] + geo_bounds["lat_max"]) / 2.0 if geo_bounds else 0.0
 
-    left, right = 0.62, 0.35
-    top = 0.95 if subtitle else 0.68
+    left, right = 0.8, 0.35
+    top = 1.12 if subtitle else 0.8
     grid_w = cols * cell_w + (cols - 1) * _GAP_X
     grid_h = rows * (cell_h + _LABEL_H) + (rows - 1) * _GAP_Y
     fig_w = max(left + grid_w + right, 9.0)
@@ -567,16 +572,16 @@ def render_composite_figure(
 
     palette = vis_params_gee.get("palette")
     if lulc_legend:
-        legend_h = 0.42 + _class_legend_grid(len(lulc_legend), inner_w)[1] * 0.2
+        legend_h = 0.5 + _class_legend_grid(len(lulc_legend), inner_w)[1] * 0.26
     elif is_rgb or not palette:
-        legend_h = 0.55
+        legend_h = 0.68
     else:
-        legend_h = 0.85
+        legend_h = 1.02
     credits = []
     for line in credit_lines or []:
-        credits.extend(textwrap.wrap(ascii_label(line), int(inner_w * 17)) or [""])
-    credit_h = 0.15 * len(credits) + (0.12 if credits else 0.0)
-    lon_label_h = 0.3
+        credits.extend(textwrap.wrap(ascii_label(line), int(inner_w * 13.2)) or [""])
+    credit_h = 0.19 * len(credits) + (0.12 if credits else 0.0)
+    lon_label_h = 0.4
     base = 0.1
     legend_y = base + credit_h
     grid_y = legend_y + legend_h + lon_label_h
@@ -588,18 +593,18 @@ def render_composite_figure(
     # TITLE + PERIOD
     # -------------------------
     title = ascii_label(title)
-    title_size = float(np.clip(fig_w * 0.92 * 72 / (0.6 * max(len(title), 1)), 11, 17))
-    fig.text(0.5, (fig_h - 0.3) / fig_h, title, ha="center", va="center", fontsize=title_size,
+    title_size = float(np.clip(fig_w * 0.92 * 72 / (0.6 * max(len(title), 1)), 13, 21))
+    fig.text(0.5, (fig_h - 0.36) / fig_h, title, ha="center", va="center", fontsize=title_size,
              fontweight="bold", color=_TEXT_DARK)
     if subtitle:
-        fig.text(0.5, (fig_h - 0.63) / fig_h, ascii_label(subtitle), ha="center", va="center",
-                 fontsize=10.5, color=_TEXT_MUTED)
+        fig.text(0.5, (fig_h - 0.76) / fig_h, ascii_label(subtitle), ha="center", va="center",
+                 fontsize=13.5, color=_TEXT_MUTED)
 
     # -------------------------
     # MAPS
     # -------------------------
     map_crs = projection["cartopy"]
-    label_size = 8.5 if cell_w >= 2.0 else 7.5
+    label_size = _FS_PANEL if cell_w >= 2.0 else _FS_PANEL_SMALL
     wide_geographic = (not projection["metric"]) and (xmax - xmin) > 40
     for i, panel in enumerate(panels):
         r, c = divmod(i, cols)
@@ -625,8 +630,8 @@ def render_composite_figure(
             gl.left_labels = (c == 0)
             gl.bottom_labels = (i + cols >= len(panels))
             gl.rotate_labels = False
-            gl.xlabel_style = {"size": 6, "color": _TICK_COL}
-            gl.ylabel_style = {"size": 6, "color": _TICK_COL}
+            gl.xlabel_style = {"size": _FS_GRATICULE, "color": _TICK_COL}
+            gl.ylabel_style = {"size": _FS_GRATICULE, "color": _TICK_COL}
         except Exception as e:
             print(f"Graticule skipped: {e}")
 
@@ -637,7 +642,7 @@ def render_composite_figure(
 
         # One scale bar serves all the maps: they share extent and projection.
         if i == (rows - 1) * cols and not wide_geographic:
-            _draw_map_scale_bar(ax, extent, projection, lat_mid, compact=cell_w < 3.2)
+            _draw_map_scale_bar(ax, extent, projection, lat_mid, compact=cell_w < 5.5, font_size=9)
 
         for spine in ax.spines.values():
             spine.set_edgecolor(_TEXT_DARK)
@@ -645,12 +650,12 @@ def render_composite_figure(
 
         label = ascii_label(panel["label"])
         note = ascii_label(panel.get("note") or "")
-        y_text = (y + cell_h + 0.075) / fig_h
+        y_text = (y + cell_h + 0.09) / fig_h
         fig.text(x / fig_w, y_text, label, ha="left", va="bottom", fontsize=label_size,
                  fontweight="bold", color=_TEXT_DARK)
         # The note is dropped rather than allowed to run into the label.
-        if note and (len(label) * 0.62 * label_size + len(note) * 0.58 * 6.5 + 8) < cell_w * 72:
-            fig.text((x + cell_w) / fig_w, y_text, note, ha="right", va="bottom", fontsize=6.5,
+        if note and (len(label) * 0.62 * label_size + len(note) * 0.58 * _FS_NOTE + 8) < cell_w * 72:
+            fig.text((x + cell_w) / fig_w, y_text, note, ha="right", va="bottom", fontsize=_FS_NOTE,
                      color=_TEXT_MUTED)
 
     # -------------------------
@@ -662,17 +667,17 @@ def render_composite_figure(
     lg.axis("off")
     _draw_strip_legend(lg, inner_w, legend_h, vis_params_gee, display_label, is_rgb, lulc_legend)
     if projection["kind"] != "laea":
-        lg.text(inner_w - 0.2, legend_h - 0.05, "N", ha="center", va="top", fontsize=8.5,
+        lg.text(inner_w - 0.2, legend_h - 0.05, "N", ha="center", va="top", fontsize=_FS_LEGEND_TITLE,
                 weight="bold", color=_TEXT_DARK)
-        lg.add_patch(mpatches.FancyArrow(inner_w - 0.2, legend_h - 0.5, 0, 0.17, width=0.012,
-                                         head_width=0.09, head_length=0.1, color="#111827", zorder=5))
+        lg.add_patch(mpatches.FancyArrow(inner_w - 0.2, legend_h - 0.62, 0, 0.22, width=0.014,
+                                         head_width=0.11, head_length=0.12, color="#111827", zorder=5))
 
     # -------------------------
     # CREDIT BLOCK
     # -------------------------
     if credits:
         fig.text(left / fig_w, (base + credit_h - 0.06) / fig_h, "\n".join(credits), ha="left", va="top",
-                 fontsize=6.8, color=_TEXT_MUTED, linespacing=1.5)
+                 fontsize=_FS_CREDIT, color=_TEXT_MUTED, linespacing=1.5)
 
     outputs = {}
     for fmt in ("png", "pdf"):
