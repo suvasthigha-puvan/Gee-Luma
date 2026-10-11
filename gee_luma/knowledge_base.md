@@ -320,3 +320,22 @@ For vegetation indices without red-edge: check MODIS precomputed first if tropic
 - `precomputed_scale`: the numeric scale factor to apply to the precomputed band (from Section 3); default 1.0.
 - `band_override`: optional dict to override spyndex variable → actual GEE band mapping if non-standard.
 - `index`: the spyndex short name (e.g. "NDVI", "kNDVI") when map_type is "SPYNDEX"; empty string otherwise.
+
+### Rule 9 — One map or several
+A request for a breakdown over time ("monthly maps", "each year", "seasonal", "climatology",
+"X vs Y") is answered with several maps in one figure: set `series` (and `panels` for named
+periods) as described with the required fields. `date_start`/`date_end` then span all the maps,
+and `temporal_reducer` applies inside each map's own period:
+
+| Request wording                                   | series               | temporal_reducer |
+|---------------------------------------------------|----------------------|------------------|
+| monthly ET / rainfall maps for a year             | monthly              | sum              |
+| monthly average temperature / LST for a year      | monthly              | mean             |
+| annual rainfall, year by year                     | annual               | sum              |
+| annual average NO2 / temperature, year by year    | annual               | mean             |
+| seasonal NDVI                                     | seasonal             | median           |
+| average monthly rainfall over many years          | monthly_climatology  | sum              |
+| long-term monthly mean temperature                | monthly_climatology  | mean             |
+| land cover in 2005, 2012 and 2020                 | custom               | mode             |
+
+A single period ("total rainfall in 2023", "NDVI for March 2024") is one map: `series` = "none".

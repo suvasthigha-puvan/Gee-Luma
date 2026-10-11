@@ -178,6 +178,7 @@ user_prompt = st.text_area(
         "- NO2 air pollution over Europe using Sentinel-5P\n"
         "- MNDWI water index for the Nile Delta, max 15% cloud cover\n"
         "- Evapotranspiration over India 2023 using MODIS MOD16A2GF\n"
+        "- Monthly ET maps of Sri Lanka for 2025 (12 maps in one figure)\n"
         "- VIIRS EVI2 for West Africa 2024"
     ),
     height=140,
@@ -233,7 +234,8 @@ if "last_result" in st.session_state:
     with m2:
         st.markdown(metric_card(res["region"], "Region"), unsafe_allow_html=True)
     with m3:
-        st.markdown(metric_card(str(res["n_images"]), "Scenes"), unsafe_allow_html=True)
+        scenes = str(res["n_images"]) + (f" in {len(res['panels'])} maps" if res.get("series") else "")
+        st.markdown(metric_card(scenes, "Scenes"), unsafe_allow_html=True)
     with m4:
         st.markdown(metric_card(res["engine"], "Engine"), unsafe_allow_html=True)
 
@@ -328,7 +330,22 @@ if "last_result" in st.session_state:
                     "missing from the dataset"
                     + (", even after gap filling." if res.get("gap_fill") else ". A longer period usually fills the gaps.")
                 )
-        if stats["kind"] == "categorical":
+        if stats["kind"] == "series":
+            # One row per map of the figure.
+            st.caption(f"{res['value_label']} over the region, for each map.")
+            st.dataframe(pd.DataFrame([
+                {"Map": r["label"], "Mean": format_value(r["mean"]), "Minimum": format_value(r["min"]),
+                 "Maximum": format_value(r["max"]), "Std dev": format_value(r["std"]),
+                 "Data (%)": "-" if r["coverage_percent"] is None else f"{r['coverage_percent']:.0f}"}
+                for r in stats["rows"]
+            ]), hide_index=True, **_stretch(st.dataframe))
+        elif stats["kind"] == "series_categorical":
+            st.caption("Share of the mapped area (%) taken by each class, for each map.")
+            st.dataframe(pd.DataFrame([
+                {"Class": r["class"], **{label: round(pct, 2) for label, pct in zip(stats["panels"], r["percent"])}}
+                for r in stats["rows"]
+            ]), hide_index=True, **_stretch(st.dataframe))
+        elif stats["kind"] == "categorical":
             table = pd.DataFrame([
                 {"Class": r["class"], "Area (km2)": round(r["area_km2"], 2), "Share (%)": round(r["percent"], 2)}
                 for r in stats["rows"]

@@ -7,6 +7,7 @@ Engine, and their export as CSV.
   - continuous maps: mean, median, min, max, standard deviation, 10th and
     90th percentiles, plus a histogram of values
   - categorical maps: area and share of the region for every class
+  - multi-map figures: the same figures for every map, side by side
 
 Statistics are computed from the same image that is drawn on the map, so
 the numbers and the picture always describe the same data.
@@ -14,6 +15,8 @@ the numbers and the picture always describe the same data.
 Public API:
   continuous_stats(...)  -> dict | None
   class_stats(...)       -> dict | None
+  series_stats(...)      -> dict | None
+  series_class_stats(...) -> dict | None
   stats_to_csv(...)      -> str
 """
 
@@ -155,6 +158,77 @@ def class_stats(class_img: ee.Image, band: str, region_geom, labels: dict | None
     }
 
 
+def series_stats(images: list, labels: list[str], band: str, region_geom, scale: float = 30) -> dict | None:
+    """
+    Mean, minimum, maximum, standard deviation and data coverage of every map
+    of a multi-map figure, in one request.
+
+    images / labels: the maps in reading order and their labels.
+    Returns {"kind": "series", "rows": [{label, mean, min, max, std,
+    coverage_percent}], "area_km2"} or None on failure.
+    """
+    try:
+        names = [f"p{i}" for i in range(len(images))]
+        values = ee.Image.cat([im.select([band]).rename([n]) for im, n in zip(images, names)])
+        # Area of each map that actually has data (not masked or missing).
+        valid = ee.Image.cat([ee.Image.pixelArea().updateMask(im.select([band]).mask()).rename([n])
+                              for im, n in zip(images, names)])
+        reducer = (ee.Reducer.mean()
+                   .combine(ee.Reducer.minMax(), sharedInputs=True)
+                   .combine(ee.Reducer.stdDev(), sharedInputs=True))
+        kwargs = dict(geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_MAX_PIXELS)
+        result = ee.Dictionary({
+            "stats": values.reduceRegion(reducer=reducer, **kwargs),
+            "valid_m2": valid.reduceRegion(reducer=ee.Reducer.sum(), **kwargs),
+            "area_km2": _region_area_km2(region_geom),
+        }).getInfo()
+    except Exception as e:
+        print(f"Series statistics failed: {e}")
+        return None
+
+    raw, valid_m2, area_km2 = result.get("stats") or {}, result.get("valid_m2") or {}, result.get("area_km2")
+    rows = []
+    for name, label in zip(names, labels):
+        coverage = None
+        if valid_m2.get(name) is not None and area_km2:
+            coverage = min(100.0, 100.0 * valid_m2[name] / 1e6 / area_km2)
+        rows.append({
+            "label": label, "mean": raw.get(f"{name}_mean"), "min": raw.get(f"{name}_min"),
+            "max": raw.get(f"{name}_max"), "std": raw.get(f"{name}_stdDev"), "coverage_percent": coverage,
+        })
+    if all(row["mean"] is None for row in rows):
+        return None
+    return {"kind": "series", "rows": rows, "area_km2": area_km2}
+
+
+def series_class_stats(images: list, labels: list[str], band: str, region_geom,
+                       class_labels: dict | None = None, scale: float = 30,
+                       share_of_region: bool = False) -> dict | None:
+    """
+    Area of every class in every map of a multi-map figure.
+
+    Returns {"kind": "series_categorical", "panels": [label, ...],
+    "rows": [{value, class, area_km2: [per map], percent: [per map]}],
+    "area_km2"}, classes sorted by their average area, or None on failure.
+    """
+    per_map = [class_stats(im, band, region_geom, class_labels, scale, share_of_region) for im in images]
+    if not any(per_map):
+        return None
+    classes: dict[int, dict] = {}
+    for i, stats in enumerate(per_map):
+        for row in (stats or {}).get("rows", []):
+            entry = classes.setdefault(row["value"], {
+                "value": row["value"], "class": row["class"],
+                "area_km2": [0.0] * len(images), "percent": [0.0] * len(images)})
+            entry["area_km2"][i] = row["area_km2"]
+            entry["percent"][i] = row["percent"]
+    rows = sorted(classes.values(), key=lambda r: sum(r["area_km2"]), reverse=True)
+    return {
+        "kind": "series_categorical", "panels": list(labels), "rows": rows,
+        "area_km2": next(s["area_km2"] for s in per_map if s),
+    }
+
+
 def format_value(value: float) -> str:
     """Number with a sensible count of digits for its size."""
     if value is None:
@@ -188,7 +262,21 @@ def stats_to_csv(stats: dict, context: dict) -> str:
         writer.writerow(["Region covered by valid data (%)", f"{stats['coverage_percent']:.1f}"])
     writer.writerow([])
 
-    if stats["kind"] == "categorical":
+    if stats["kind"] == "series":
+        writer.writerow(["Map", "Mean", "Minimum", "Maximum", "Standard deviation",
+                         "Region covered by valid data (%)"])
+        for row in stats["rows"]:
+            writer.writerow([row["label"]]
+                            + ["" if row[k] is None else repr(float(row[k])) for k in ("mean", "min", "max", "std")]
+                            + ["" if row["coverage_percent"] is None else f"{row['coverage_percent']:.1f}"])
+    elif stats["kind"] == "series_categorical":
+        writer.writerow(["Class value", "Class"]
+                        + [f"{label} area (km2)" for label in stats["panels"]]
+                        + [f"{label} share (%)" for label in stats["panels"]])
+        for row in stats["rows"]:
+            writer.writerow([row["value"], row["class"]]
+                            + [f"{v:.3f}" for v in row["area_km2"]] + [f"{v:.2f}" for v in row["percent"]])
+    elif stats["kind"] == "categorical":
         writer.writerow(["Class value", "Class", "Area (km2)", "Share of area (%)"])
         for row in stats["rows"]:
             writer.writerow([row["value"], row["class"], f"{row['area_km2']:.3f}", f"{row['percent']:.2f}"])

@@ -50,7 +50,8 @@ def _download(url, timeout, attempts=2):
     raise RuntimeError(last or "download failed")
 
 
-def _fetch_tiled(vis_img, vis_params, extent, crs, width, height):
+def _tile_jobs(vis_img, vis_params, extent, crs, width, height):
+    """Tiles covering the image: [(x px, y px, width px, height px, url), ...]."""
     xmin, xmax, ymin, ymax = extent
     n_cols = max(math.ceil(width / TILE_SIZE), 1)
     n_rows = max(math.ceil(height / TILE_SIZE), 1)
@@ -71,15 +72,32 @@ def _fetch_tiled(vis_img, vis_params, extent, crs, width, height):
             # thread-safe); only the downloads run in parallel.
             url = _thumb_url(vis_img, vis_params, (x0, y0, x1, y1), crs, w, h)
             jobs.append((col_px[i], row_px[j], w, h, url))
+    return jobs
 
+
+def _stitch(jobs, tiles, width, height):
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
-        tiles = list(pool.map(lambda job: _download(job[4], timeout=120, attempts=1), jobs))
     for (px, py, w, h, _), tile in zip(jobs, tiles):
         if tile.size != (w, h):
             tile = tile.resize((w, h), Image.NEAREST)
         canvas.paste(tile, (px, py))
     return canvas
+
+
+def _fetch_tiled(vis_img, vis_params, extent, crs, width, height):
+    jobs = _tile_jobs(vis_img, vis_params, extent, crs, width, height)
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+        tiles = list(pool.map(lambda job: _download(job[4], timeout=120, attempts=1), jobs))
+    return _stitch(jobs, tiles, width, height)
+
+
+def _dimensions(extent, long_side):
+    """Pixel width and height for `extent` with square pixels and the given longest side."""
+    xmin, xmax, ymin, ymax = extent
+    aspect = (xmax - xmin) / max(ymax - ymin, 1e-9)
+    if aspect >= 1:
+        return long_side, max(int(round(long_side / aspect)), 1)
+    return max(int(round(long_side * aspect)), 1), long_side
 
 
 def fetch_thumbnail_with_retry(vis_img, vis_params, extent, crs, target_long_side=TARGET_LONG_SIDE):
@@ -96,12 +114,9 @@ def fetch_thumbnail_with_retry(vis_img, vis_params, extent, crs, target_long_sid
     Returns (PIL image, longest side in pixels).
     """
     xmin, xmax, ymin, ymax = extent
-    aspect = (xmax - xmin) / max(ymax - ymin, 1e-9)
 
     def _size(long_side):
-        if aspect >= 1:
-            return long_side, max(int(round(long_side / aspect)), 1)
-        return max(int(round(long_side * aspect)), 1), long_side
+        return _dimensions(extent, long_side)
 
     errors = []
     try:
@@ -122,3 +137,40 @@ def fetch_thumbnail_with_retry(vis_img, vis_params, extent, crs, target_long_sid
         except Exception as e:
             errors.append(f"{dim}px: {e}")
     raise RuntimeError("Earth Engine could not render the map (" + "; ".join(errors)[:600] + ").")
+
+
+def fetch_panel_thumbnails(vis_imgs, vis_params, extent, crs, long_side, on_panel=None):
+    """
+    Render several images over the same extent, with the same visualisation -
+    the maps of one multi-map figure.
+
+    The tiles of all the maps are downloaded together, so a figure of twelve
+    maps takes little longer than one. A map whose tiles fail is requested
+    again on its own, at a smaller size if need be.
+    on_panel(done, total): called as each map is finished, for progress.
+    Returns a list of PIL images, one per input image, each covering `extent`.
+    """
+    width, height = _dimensions(extent, long_side)
+    # URLs are created one at a time (the Earth Engine client is not thread-safe).
+    jobs_per_map = [_tile_jobs(img, vis_params, extent, crs, width, height) for img in vis_imgs]
+
+    def _try(job):
+        try:
+            return _download(job[4], timeout=150, attempts=2)
+        except Exception as e:
+            return e
+
+    images = []
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+        pending = [[pool.submit(_try, job) for job in jobs] for jobs in jobs_per_map]
+        for index, (jobs, futures) in enumerate(zip(jobs_per_map, pending)):
+            tiles = [f.result() for f in futures]
+            if any(isinstance(t, Exception) for t in tiles):
+                image, _dim = fetch_thumbnail_with_retry(vis_imgs[index], vis_params, extent, crs,
+                                                         target_long_side=long_side)
+            else:
+                image = _stitch(jobs, tiles, width, height)
+            images.append(image)
+            if on_panel:
+                on_panel(index + 1, len(vis_imgs))
+    return images

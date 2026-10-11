@@ -594,3 +594,26 @@ def auto_vis_params(img: ee.Image, band: str, region_geom, percentile: int = 2) 
         return {"min": lo or 0, "max": hi or 1}
     except Exception:
         return {"min": 0, "max": 1}
+
+
+def shared_vis_range(images: list, band: str, region_geom, percentile: int = 2) -> dict | None:
+    """
+    One display range for several images of the same variable (the maps of a
+    multi-map figure), so a colour means the same value on every map: from
+    the lowest low percentile to the highest high percentile among them.
+    Returns {"min": ..., "max": ...} or None if it could not be computed.
+    """
+    try:
+        names = [f"p{i}" for i in range(len(images))]
+        stack = ee.Image.cat([im.select([band]).rename([n]) for im, n in zip(images, names)])
+        stats = stack.reduceRegion(
+            reducer=ee.Reducer.percentile([percentile, 100 - percentile]),
+            geometry=region_geom, scale=500, maxPixels=1e8, bestEffort=True,
+        ).getInfo()
+        lows = [v for n in names if (v := stats.get(f"{n}_p{percentile}")) is not None]
+        highs = [v for n in names if (v := stats.get(f"{n}_p{100 - percentile}")) is not None]
+        if not lows or not highs or max(highs) <= min(lows):
+            return None
+        return {"min": min(lows), "max": max(highs)}
+    except Exception:
+        return None

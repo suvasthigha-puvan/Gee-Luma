@@ -1,4 +1,4 @@
-import type { CategoricalStats, ContinuousStats, Stats } from "../types";
+import type { CategoricalStats, ContinuousStats, SeriesClassStats, SeriesStats, Stats } from "../types";
 import { formatArea, formatValue } from "../format";
 
 interface Props {
@@ -20,10 +20,116 @@ export function StatsPanel({ stats, valueLabel, isRgb }: Props) {
       </section>
     );
   }
+  if (stats.kind === "series") return <SeriesValueStats stats={stats} valueLabel={valueLabel} />;
+  if (stats.kind === "series_categorical") return <SeriesClassShares stats={stats} />;
   return stats.kind === "categorical" ? (
     <ClassStats stats={stats} />
   ) : (
     <ValueStats stats={stats} valueLabel={valueLabel} />
+  );
+}
+
+/** Multi-map figure: the regional mean of every map as a bar, with its range beside it. */
+function SeriesValueStats({ stats, valueLabel }: { stats: SeriesStats; valueLabel: string }) {
+  const means = stats.rows.map((r) => r.mean).filter((v): v is number => v !== null);
+  // Bars start at zero unless the values go below it (temperatures, indices).
+  const low = Math.min(0, ...means);
+  const span = Math.max(...means, 0) - low || 1;
+  const gaps = stats.rows.some((r) => r.coverage_percent !== null && r.coverage_percent < 99.5);
+  return (
+    <section className="card">
+      <div className="card-head">
+        <h3 className="card-title">Statistics by map</h3>
+        <span className="card-sub">{valueLabel}</span>
+      </div>
+      <div className="table-scroll">
+        <table className="series-table">
+          <thead>
+            <tr>
+              <th scope="col">Map</th>
+              <th scope="col" className="series-mean-head">
+                Mean
+              </th>
+              <th scope="col">Min</th>
+              <th scope="col">Max</th>
+              <th scope="col">Std dev</th>
+              {gaps && <th scope="col">Data</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {stats.rows.map((r) => (
+              <tr key={r.label}>
+                <th scope="row">{r.label}</th>
+                <td className="series-mean">
+                  <span className="series-track" aria-hidden="true">
+                    {r.mean !== null && (
+                      <span
+                        className="series-fill"
+                        style={{
+                          left: `${((Math.min(r.mean, 0) - low) / span) * 100}%`,
+                          width: `${Math.max((Math.abs(r.mean) / span) * 100, 0.5)}%`,
+                        }}
+                      />
+                    )}
+                  </span>
+                  <span>{formatValue(r.mean)}</span>
+                </td>
+                <td>{formatValue(r.min)}</td>
+                <td>{formatValue(r.max)}</td>
+                <td>{formatValue(r.std)}</td>
+                {gaps && <td>{r.coverage_percent === null ? "–" : `${Math.round(r.coverage_percent)}%`}</td>}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <dl className="kv">
+        <div>
+          <dt>Region area</dt>
+          <dd>{formatArea(stats.area_km2)}</dd>
+        </div>
+      </dl>
+    </section>
+  );
+}
+
+/** Multi-map figure of a classified band: each class's share of the area, map by map. */
+function SeriesClassShares({ stats }: { stats: SeriesClassStats }) {
+  const share = (p: number) => (p >= 0.05 ? p.toFixed(1) : p > 0 ? "<0.1" : "–");
+  return (
+    <section className="card">
+      <div className="card-head">
+        <h3 className="card-title">Class shares by map</h3>
+        <span className="card-sub">% of area · region {formatArea(stats.area_km2)}</span>
+      </div>
+      <div className="table-scroll">
+        <table className="series-table">
+          <thead>
+            <tr>
+              <th scope="col">Class</th>
+              {stats.panels.map((label) => (
+                <th scope="col" key={label}>
+                  {label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {stats.rows.map((r) => (
+              <tr key={r.value}>
+                <th scope="row">
+                  {r.color && <span className="class-swatch" style={{ background: r.color }} aria-hidden="true" />}
+                  {r.class}
+                </th>
+                {r.percent.map((p, i) => (
+                  <td key={i}>{share(p)}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 

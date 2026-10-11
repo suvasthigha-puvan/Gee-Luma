@@ -57,10 +57,11 @@ def _fmt_distance(km: float) -> str:
     return f"{km:,.0f} km" if km >= 1000 else f"{km:g} km"
 
 
-def _draw_map_scale_bar(map_ax, extent, projection, lat_mid):
+def _draw_map_scale_bar(map_ax, extent, projection, lat_mid, compact=False):
     """
     Draw a scale bar in the lower-left corner of the map, in map coordinates,
     so its drawn length is the ground distance it is labelled with.
+    compact: for small maps - a longer bar labelled at its ends only.
     """
     xmin, xmax, ymin, ymax = extent
     width, height = xmax - xmin, ymax - ymin
@@ -68,7 +69,7 @@ def _draw_map_scale_bar(map_ax, extent, projection, lat_mid):
     # degrees of longitude at the map's middle latitude.
     units_per_km = 1000.0 if projection["metric"] else 1.0 / (111.32 * max(np.cos(np.radians(lat_mid)), 1e-6))
 
-    length_km = _nice_length(width / units_per_km * 0.22)
+    length_km = _nice_length(width / units_per_km * (0.36 if compact else 0.22))
     length    = length_km * units_per_km
 
     x0    = xmin + 0.035 * width
@@ -88,9 +89,10 @@ def _draw_map_scale_bar(map_ax, extent, projection, lat_mid):
             transform=crs, zorder=9, path_effects=halo))
 
     y_text = y0 + bar_h + 0.008 * height
-    for x, label in ((x0, "0"),
-                     (x0 + length / 2, f"{length_km / 2:g}"),
-                     (x0 + length, _fmt_distance(length_km))):
+    labels = [(x0, "0"), (x0 + length / 2, f"{length_km / 2:g}"), (x0 + length, _fmt_distance(length_km))]
+    if compact:
+        del labels[1]
+    for x, label in labels:
         map_ax.text(x, y_text, label, ha="center", va="bottom", fontsize=7,
                     color=_TEXT_DARK, transform=crs, zorder=9, path_effects=halo)
 
@@ -171,9 +173,13 @@ def _draw_colorbar_legend(ap, palette, vmin, vmax, label, y_top):
     ap.text(0.5, y_top, "\n".join(textwrap.wrap(ascii_label(label), 30)[:3]),
             ha='center', va='top', fontsize=8, weight='bold', color=_TEXT_DARK,
             transform=ap.transAxes, linespacing=1.3)
+    _fill_colorbar(ap.inset_axes([0.09, y_top - 0.185, 0.82, 0.045]), palette, vmin, vmax)
+
+
+def _fill_colorbar(cax, palette, vmin, vmax, tick_size=6.5):
+    """Draw the colour ramp into `cax`, with ticks at round values."""
     if vmax <= vmin:
         vmax = vmin + 1
-    cax  = ap.inset_axes([0.09, y_top - 0.185, 0.82, 0.045])
     cmap = LinearSegmentedColormap.from_list("legend", palette)
     cb   = mcolorbar.ColorbarBase(cax, cmap=cmap, norm=mcolors.Normalize(vmin=vmin, vmax=vmax),
                                   orientation='horizontal')
@@ -184,7 +190,7 @@ def _draw_colorbar_legend(ap, palette, vmin, vmax, label, y_top):
     step = abs(ticks[1] - ticks[0])
     cb.set_ticks(ticks)
     cb.set_ticklabels([_fmt_tick(t, step) for t in ticks])
-    cb.ax.tick_params(labelsize=6.5, length=2.5, width=0.5, color=_TEXT_DARK)
+    cb.ax.tick_params(labelsize=tick_size, length=2.5, width=0.5, color=_TEXT_DARK)
     for tl in cb.ax.get_xticklabels():
         tl.set_color(_TEXT_DARK)
     cb.outline.set_linewidth(0.5)
@@ -231,6 +237,18 @@ def _draw_locator(ap, bounds_axes, geo_bounds, outline_geojson):
     except Exception as e:  # Natural Earth download failed, etc. - the map is still valid without it
         print(f"Locator map skipped: {e}")
         return False
+
+
+def _draw_context_lines(map_ax, geo_bounds):
+    """Coastlines and country borders, for maps that have no region outline."""
+    try:
+        span = max(geo_bounds["lon_max"] - geo_bounds["lon_min"],
+                   geo_bounds["lat_max"] - geo_bounds["lat_min"])
+        scale = "110m" if span > 60 else ("50m" if span > 8 else "10m")
+        map_ax.add_feature(cfeature.COASTLINE.with_scale(scale), edgecolor="#1f2933", linewidth=0.5, zorder=3)
+        map_ax.add_feature(cfeature.BORDERS.with_scale(scale), edgecolor="#52606d", linewidth=0.35, zorder=3)
+    except Exception as e:
+        print(f"Context lines skipped: {e}")
 
 
 # ====================== MAIN RENDERER ======================
@@ -315,14 +333,7 @@ def render_cartographic_figure(
     # Without a region outline (bounding-box regions such as continents) the
     # data needs coastlines and borders to be readable.
     if not uploaded_geojson and not boundary_geojson and geo_bounds:
-        try:
-            span = max(geo_bounds["lon_max"] - geo_bounds["lon_min"],
-                       geo_bounds["lat_max"] - geo_bounds["lat_min"])
-            scale = "110m" if span > 60 else ("50m" if span > 8 else "10m")
-            map_ax.add_feature(cfeature.COASTLINE.with_scale(scale), edgecolor="#1f2933", linewidth=0.5, zorder=3)
-            map_ax.add_feature(cfeature.BORDERS.with_scale(scale), edgecolor="#52606d", linewidth=0.35, zorder=3)
-        except Exception as e:
-            print(f"Context lines skipped: {e}")
+        _draw_context_lines(map_ax, geo_bounds)
 
     # -------------------------
     # GRATICULE (latitude / longitude lines, labelled on the left and bottom)
@@ -417,6 +428,256 @@ def render_cartographic_figure(
     for fmt in ("png", "pdf"):
         buf = io.BytesIO()
         fig.savefig(buf, format=fmt, dpi=300, bbox_inches='tight', pad_inches=0.18)
+        outputs[fmt] = buf.getvalue()
+    plt.close(fig)
+    return outputs
+
+
+# ====================== MULTI-MAP FIGURE ======================
+
+# Layout of the grid of maps, in inches. The grid is fitted into a page-sized
+# box; the figure then grows around it for the title, legend and credits.
+_GRID_MAX_W, _GRID_MAX_H = 15.0, 9.6
+_CELL_MAX = 6.5         # no single map needs to be larger than this
+_LABEL_H = 0.27         # strip above each map for its label
+_GAP_X, _GAP_Y = 0.16, 0.13
+
+
+def choose_grid_layout(n_maps: int, aspect: float) -> dict:
+    """
+    Rows and columns for `n_maps` maps of the given width/height ratio.
+
+    Every arrangement is tried and the one that draws the maps largest on the
+    page wins, so tall regions get many columns (12 maps: 6 x 2), wide regions
+    many rows (3 x 4) and compact ones something in between (4 x 3). Empty
+    cells count against an arrangement.
+
+    Returns {"rows", "cols", "cell_w", "cell_h" (inches), "panel_px"}, where
+    panel_px is the longest side to render each map at for 300 dpi.
+    """
+    aspect = float(np.clip(aspect, 0.05, 20.0))
+    best, best_score = None, -1.0
+    for cols in range(1, n_maps + 1):
+        rows = int(np.ceil(n_maps / cols))
+        room_w = (_GRID_MAX_W - (cols - 1) * _GAP_X) / cols
+        room_h = (_GRID_MAX_H - rows * _LABEL_H - (rows - 1) * _GAP_Y) / rows
+        if room_w <= 0 or room_h <= 0:
+            continue
+        cell_w = min(room_w, room_h * aspect)
+        cell_h = cell_w / aspect
+        shrink = min(1.0, _CELL_MAX / max(cell_w, cell_h))
+        cell_w, cell_h = cell_w * shrink, cell_h * shrink
+        empty_share = (rows * cols - n_maps) / (rows * cols)
+        score = cell_w * cell_h * (1.0 - 0.5 * empty_share)
+        if score > best_score * 1.0001:
+            best, best_score = {"rows": rows, "cols": cols, "cell_w": cell_w, "cell_h": cell_h}, score
+    best["panel_px"] = int(np.clip(np.ceil(max(best["cell_w"], best["cell_h"]) * 300 / 64) * 64, 384, 1024))
+    return best
+
+
+def _draw_strip_legend(lg, width, height, vis_params_gee, display_label, is_rgb, lulc_legend):
+    """
+    The figure's one shared legend, in a strip under the maps. `lg` is an axes
+    whose data coordinates are inches (0..width, 0..height).
+    """
+    palette = vis_params_gee.get("palette")
+    if lulc_legend:
+        lg.text(width / 2, height - 0.05, ascii_label(display_label), ha="center", va="top",
+                fontsize=8.5, weight="bold", color=_TEXT_DARK)
+        n_cols, n_rows = _class_legend_grid(len(lulc_legend), width)
+        col_w = width / n_cols
+        for i, item in enumerate(lulc_legend):
+            x = (i // n_rows) * col_w + 0.1
+            y = height - 0.42 - (i % n_rows) * 0.2
+            label = textwrap.shorten(ascii_label(item["label"]), int(col_w * 15), placeholder="...")
+            if not item.get("color"):
+                lg.text(x, y, label, ha="left", va="center", fontsize=7, style="italic", color=_TEXT_MUTED)
+                continue
+            lg.add_patch(mpatches.Rectangle((x, y - 0.065), 0.2, 0.13, facecolor=item["color"],
+                                            edgecolor="#333", lw=0.5))
+            lg.text(x + 0.28, y, label, ha="left", va="center", fontsize=7, color=_TEXT_DARK)
+    elif is_rgb or not palette:
+        bands = vis_params_gee.get("bands", [])
+        channels = [("Red", "#d64545"), ("Green", "#3f9d4b"), ("Blue", "#3f6fd1")]
+        entry_w = min(2.2, width / 3)
+        x0 = (width - 3 * entry_w) / 2
+        lg.text(width / 2, height - 0.05, "Colour composite", ha="center", va="top",
+                fontsize=8.5, weight="bold", color=_TEXT_DARK)
+        for i, (channel, colour) in enumerate(channels):
+            band = bands[i] if i < len(bands) else channel
+            lg.add_patch(mpatches.Rectangle((x0 + i * entry_w, 0.1), 0.2, 0.13, facecolor=colour,
+                                            edgecolor="#333", lw=0.5))
+            lg.text(x0 + i * entry_w + 0.28, 0.165, _CHANNEL_BAND_NAMES.get(band, str(band)),
+                    ha="left", va="center", fontsize=7, color=_TEXT_DARK)
+    else:
+        bar_w = min(6.0, width * 0.7)
+        lg.text(width / 2, height - 0.05, ascii_label(display_label), ha="center", va="top",
+                fontsize=8.5, weight="bold", color=_TEXT_DARK)
+        cax = lg.inset_axes([(width - bar_w) / 2, height - 0.5, bar_w, 0.17], transform=lg.transData)
+        _fill_colorbar(cax, palette, float(vis_params_gee.get("min", 0)),
+                       float(vis_params_gee.get("max", 1)), tick_size=7)
+
+
+def _class_legend_grid(n_classes: int, width: float) -> tuple[int, int]:
+    """Columns and rows of a class legend laid out across `width` inches."""
+    n_cols = int(max(1, min(n_classes, width // 2.3)))
+    return n_cols, int(np.ceil(n_classes / n_cols))
+
+
+def render_composite_figure(
+    panels,
+    layout,
+    extent,
+    projection,
+    title,
+    vis_params_gee,
+    display_label,
+    is_rgb,
+    geo_bounds,
+    subtitle: str | None = None,
+    lulc_legend=None,
+    uploaded_geojson=None,
+    boundary_geojson=None,
+    credit_lines: list[str] | None = None,
+    **_unused,
+):
+    """
+    Lay out several maps of the same region in one figure.
+
+    panels: [{"image": PIL image covering `extent`, "label": str, "note": str | None}],
+            in reading order. Every map uses the same extent, projection and
+            colours, so one legend serves them all.
+    layout: dict from choose_grid_layout()
+    The other arguments are those of render_cartographic_figure().
+
+    Returns {"png": bytes, "pdf": bytes}.
+    """
+    xmin, xmax, ymin, ymax = extent
+    rows, cols = layout["rows"], layout["cols"]
+    cell_w, cell_h = layout["cell_w"], layout["cell_h"]
+    lat_mid = (geo_bounds["lat_min"] + geo_bounds["lat_max"]) / 2.0 if geo_bounds else 0.0
+
+    left, right = 0.62, 0.35
+    top = 0.95 if subtitle else 0.68
+    grid_w = cols * cell_w + (cols - 1) * _GAP_X
+    grid_h = rows * (cell_h + _LABEL_H) + (rows - 1) * _GAP_Y
+    fig_w = max(left + grid_w + right, 9.0)
+    inner_w = fig_w - left - right
+    grid_x = left + (inner_w - grid_w) / 2
+
+    palette = vis_params_gee.get("palette")
+    if lulc_legend:
+        legend_h = 0.42 + _class_legend_grid(len(lulc_legend), inner_w)[1] * 0.2
+    elif is_rgb or not palette:
+        legend_h = 0.55
+    else:
+        legend_h = 0.85
+    credits = []
+    for line in credit_lines or []:
+        credits.extend(textwrap.wrap(ascii_label(line), int(inner_w * 17)) or [""])
+    credit_h = 0.15 * len(credits) + (0.12 if credits else 0.0)
+    lon_label_h = 0.3
+    base = 0.1
+    legend_y = base + credit_h
+    grid_y = legend_y + legend_h + lon_label_h
+    fig_h = grid_y + grid_h + top
+
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+
+    # -------------------------
+    # TITLE + PERIOD
+    # -------------------------
+    title = ascii_label(title)
+    title_size = float(np.clip(fig_w * 0.92 * 72 / (0.6 * max(len(title), 1)), 11, 17))
+    fig.text(0.5, (fig_h - 0.3) / fig_h, title, ha="center", va="center", fontsize=title_size,
+             fontweight="bold", color=_TEXT_DARK)
+    if subtitle:
+        fig.text(0.5, (fig_h - 0.63) / fig_h, ascii_label(subtitle), ha="center", va="center",
+                 fontsize=10.5, color=_TEXT_MUTED)
+
+    # -------------------------
+    # MAPS
+    # -------------------------
+    map_crs = projection["cartopy"]
+    label_size = 8.5 if cell_w >= 2.0 else 7.5
+    wide_geographic = (not projection["metric"]) and (xmax - xmin) > 40
+    for i, panel in enumerate(panels):
+        r, c = divmod(i, cols)
+        x = grid_x + c * (cell_w + _GAP_X)
+        y = grid_y + (rows - 1 - r) * (cell_h + _LABEL_H + _GAP_Y)
+        ax = fig.add_axes([x / fig_w, y / fig_h, cell_w / fig_w, cell_h / fig_h], projection=map_crs)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.imshow(panel["image"], extent=[xmin, xmax, ymin, ymax], origin="upper",
+                  transform=map_crs, interpolation="nearest", zorder=1)
+        if not uploaded_geojson and not boundary_geojson and geo_bounds:
+            _draw_context_lines(ax, geo_bounds)
+
+        # Graticule on every map; its labels only down the left side and along
+        # the bottom of the grid, where they serve the whole row or column.
+        try:
+            gl = ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.3,
+                              linestyle="--", x_inline=False, y_inline=False, zorder=4)
+            gl.xlocator = mticker.MaxNLocator(nbins=3)
+            gl.ylocator = mticker.MaxNLocator(nbins=4)
+            gl.top_labels = False
+            gl.right_labels = False
+            gl.left_labels = (c == 0)
+            gl.bottom_labels = (i + cols >= len(panels))
+            gl.rotate_labels = False
+            gl.xlabel_style = {"size": 6, "color": _TICK_COL}
+            gl.ylabel_style = {"size": 6, "color": _TICK_COL}
+        except Exception as e:
+            print(f"Graticule skipped: {e}")
+
+        if uploaded_geojson:
+            draw_geojson_outline(ax, uploaded_geojson, color="black", linewidth=0.9)
+        elif boundary_geojson:
+            draw_geojson_outline(ax, boundary_geojson, color=_TEXT_DARK, linewidth=0.7)
+
+        # One scale bar serves all the maps: they share extent and projection.
+        if i == (rows - 1) * cols and not wide_geographic:
+            _draw_map_scale_bar(ax, extent, projection, lat_mid, compact=cell_w < 3.2)
+
+        for spine in ax.spines.values():
+            spine.set_edgecolor(_TEXT_DARK)
+            spine.set_linewidth(0.7)
+
+        label = ascii_label(panel["label"])
+        note = ascii_label(panel.get("note") or "")
+        y_text = (y + cell_h + 0.075) / fig_h
+        fig.text(x / fig_w, y_text, label, ha="left", va="bottom", fontsize=label_size,
+                 fontweight="bold", color=_TEXT_DARK)
+        # The note is dropped rather than allowed to run into the label.
+        if note and (len(label) * 0.62 * label_size + len(note) * 0.58 * 6.5 + 8) < cell_w * 72:
+            fig.text((x + cell_w) / fig_w, y_text, note, ha="right", va="bottom", fontsize=6.5,
+                     color=_TEXT_MUTED)
+
+    # -------------------------
+    # SHARED LEGEND + NORTH ARROW
+    # -------------------------
+    lg = fig.add_axes([left / fig_w, legend_y / fig_h, inner_w / fig_w, legend_h / fig_h])
+    lg.set_xlim(0, inner_w)
+    lg.set_ylim(0, legend_h)
+    lg.axis("off")
+    _draw_strip_legend(lg, inner_w, legend_h, vis_params_gee, display_label, is_rgb, lulc_legend)
+    if projection["kind"] != "laea":
+        lg.text(inner_w - 0.2, legend_h - 0.05, "N", ha="center", va="top", fontsize=8.5,
+                weight="bold", color=_TEXT_DARK)
+        lg.add_patch(mpatches.FancyArrow(inner_w - 0.2, legend_h - 0.5, 0, 0.17, width=0.012,
+                                         head_width=0.09, head_length=0.1, color="#111827", zorder=5))
+
+    # -------------------------
+    # CREDIT BLOCK
+    # -------------------------
+    if credits:
+        fig.text(left / fig_w, (base + credit_h - 0.06) / fig_h, "\n".join(credits), ha="left", va="top",
+                 fontsize=6.8, color=_TEXT_MUTED, linespacing=1.5)
+
+    outputs = {}
+    for fmt in ("png", "pdf"):
+        buf = io.BytesIO()
+        fig.savefig(buf, format=fmt, dpi=300, bbox_inches="tight", pad_inches=0.18)
         outputs[fmt] = buf.getvalue()
     plt.close(fig)
     return outputs

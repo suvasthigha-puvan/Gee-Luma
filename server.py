@@ -58,6 +58,7 @@ EXAMPLE_REQUESTS = [
     {"label": "Vegetation", "text": "NDVI map for Sri Lanka using Sentinel-2, last 3 months"},
     {"label": "Land cover", "text": "Land cover map of Kandy district"},
     {"label": "Rainfall", "text": "Total rainfall in Sri Lanka for 2023"},
+    {"label": "Monthly maps", "text": "Monthly ET maps of Sri Lanka for 2025"},
     {"label": "True colour", "text": "True-color image of Galle district using Sentinel-2, January to March 2024"},
     {"label": "Temperature", "text": "Land surface temperature of Tamil Nadu in April 2024"},
     {"label": "Elevation", "text": "Elevation map of Nepal"},
@@ -267,6 +268,8 @@ def _result_payload(job: Job) -> dict | None:
             "projection": res.get("projection"),
         },
         "gap_fill": res.get("gap_fill"),
+        "series": ({"kind": res["series"], "grid": res.get("grid"), "maps": res.get("panels") or []}
+                   if res.get("series") else None),
         "original_rendered": bool(res.get("original")),
         "stats": stats,
         "has_csv": bool(res.get("stats_csv")),

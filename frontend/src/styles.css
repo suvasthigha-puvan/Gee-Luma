@@ -1499,6 +1499,82 @@ kbd {
   min-width: 120px;
 }
 
+/* Statistics of a multi-map figure: one row per map */
+.table-scroll {
+  overflow-x: auto;
+}
+
+.series-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.series-table th,
+.series-table td {
+  padding: 7px 0 7px 14px;
+  border-top: 1px solid var(--border);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.series-table th:first-child {
+  padding-left: 0;
+  text-align: left;
+}
+
+.series-table thead th {
+  border-top: 0;
+  padding-top: 0;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+.series-table tbody th {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.series-table td {
+  font-family: var(--font-mono);
+  color: var(--text-2);
+}
+
+.series-table th.series-mean-head {
+  width: 46%;
+}
+
+.series-table td.series-mean {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+}
+
+.series-track {
+  position: relative;
+  flex: 1;
+  min-width: 48px;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.series-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 4px;
+  background: var(--accent);
+  opacity: 0.85;
+}
+
+.series-table .class-swatch {
+  margin-right: 7px;
+}
+
 .class-bars {
   list-style: none;
   margin: 0;

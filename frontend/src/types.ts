@@ -61,7 +61,39 @@ export interface CategoricalStats {
   mapped_km2: number | null;
 }
 
-export type Stats = ContinuousStats | CategoricalStats;
+/** One map of a multi-map figure. */
+export interface SeriesRow {
+  label: string;
+  mean: number | null;
+  min: number | null;
+  max: number | null;
+  std: number | null;
+  coverage_percent: number | null;
+}
+
+export interface SeriesStats {
+  kind: "series";
+  rows: SeriesRow[];
+  area_km2: number | null;
+}
+
+export interface SeriesClassRow {
+  value: number;
+  class: string;
+  color?: string;
+  /** One entry per map, in the order of `panels`. */
+  area_km2: number[];
+  percent: number[];
+}
+
+export interface SeriesClassStats {
+  kind: "series_categorical";
+  panels: string[];
+  rows: SeriesClassRow[];
+  area_km2: number | null;
+}
+
+export type Stats = ContinuousStats | CategoricalStats | SeriesStats | SeriesClassStats;
 
 export interface GapFill {
   original_percent: number;
@@ -94,6 +126,8 @@ export interface MapResult {
     projection: string;
   };
   gap_fill: GapFill | null;
+  /** Set when the figure holds several maps (monthly, annual, ...). */
+  series: { kind: string; grid: string | null; maps: { label: string; images: number }[] } | null;
   original_rendered: boolean;
   stats: Stats | null;
   has_csv: boolean;

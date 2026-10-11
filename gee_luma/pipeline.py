@@ -6,6 +6,10 @@ The map pipeline, independent of any user interface:
     request text -> agent decision -> region -> dataset -> composite
     -> gap filling -> computation -> statistics -> rendered map + exports
 
+A request for several maps (one per month, season or year, a multi-year
+climatology, or named periods to compare) follows the same path with one
+composite per map, and ends in a single figure with a shared legend.
+
 `run_pipeline()` reports progress through a small `ui` object, so the same
 code drives the Streamlit app (which passes Streamlit itself) and the web
 API (which passes a recorder that turns the calls into progress events).
@@ -30,7 +34,7 @@ import time
 import requests
 import re
 import unicodedata
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 import textwrap
@@ -82,23 +86,29 @@ from gee_luma.dataset_config import (
     lulc_classes_for_display, lulc_vis_for_classes,
     introspect_collection, get_dataset_band_map,
     get_scale_config, resolve_is_static, detect_cloud_prop,
-    is_sar_collection, auto_vis_params,
+    is_sar_collection, auto_vis_params, shared_vis_range,
 )
 from gee_luma.palettes import INDEX_PALETTES, PRECOMPUTED_PALETTE_MAP, get_palette
 from gee_luma.map_engine import compute_spyndex_on_gee, compute_special_map
-from gee_luma.cartography import render_cartographic_figure
+from gee_luma.cartography import render_cartographic_figure, render_composite_figure, choose_grid_layout
 from gee_luma.projection import choose_map_projection, projected_extent
 from gee_luma.stac_metadata import (
     fetch_dataset_metadata, get_dataset_info_tool,
     stac_palette_for_band, band_display_label,
 )
-from gee_luma.thumbnail import fetch_thumbnail_with_retry
+from gee_luma.thumbnail import fetch_thumbnail_with_retry, fetch_panel_thumbnails
 from gee_luma.geojson_helpers import (
     _ensure_wgs84, geojson_to_ee_geometry,
     get_geojson_bounds, get_geojson_label,
 )
 from gee_luma.boundary_agent import BoundaryAgent
-from gee_luma.map_stats import continuous_stats, class_stats, stats_to_csv, format_value
+from gee_luma.map_stats import (
+    continuous_stats, class_stats, series_stats, series_class_stats, stats_to_csv, format_value,
+)
+from gee_luma.time_series import (
+    CLIMATOLOGIES, MAX_PANELS, normalise_series, infer_series_from_prompt, build_panels,
+    series_title, series_subtitle, series_processing,
+)
 from gee_luma.class_legend import (
     is_class_candidate, distinct_values, snap_to_values, shorten_legend, MAX_DETECTED_CLASSES,
 )
@@ -175,6 +185,64 @@ def data_coverage_percent(image, band: str, region_geom, scale: float) -> float:
     percent = (ee.Number(ee.Algorithms.If(valid_m2, valid_m2, 0))
                .divide(region_geom.area(maxError=100)).multiply(100).getInfo())
     return float(min(max(percent, 0.0), 100.0))
+
+
+# Totals per period from images that each cover several days (8-day ET,
+# 16-day or monthly sums). Such an image often straddles two periods: counted
+# whole in the one it starts in, months would get three or four 8-day images
+# by accident of the calendar and their totals would differ for that reason
+# alone. Each image is instead divided between the periods by days.
+
+def multi_day_periods(images) -> dict | None:
+    """
+    {start: end} in milliseconds for the period every image of `images`
+    covers, or None when the images cover a day or less each (or do not say).
+
+    An image's stated end is cut back to the start of the next image: the
+    last 8-day MODIS image of a year is stamped as running four days into
+    January although it holds only the days left in December.
+    """
+    try:
+        first = images.first()
+        days = (ee.Number(first.get("system:time_end")).subtract(first.get("system:time_start"))
+                .divide(86_400_000).getInfo())
+        if not days or days <= 1.5:
+            return None
+        pairs = images.reduceColumns(
+            ee.Reducer.toList(2), ["system:time_start", "system:time_end"]).get("list").getInfo()
+    except Exception:
+        return None
+    ends: dict[int, int] = {}
+    for start, end in pairs:
+        ends[int(start)] = max(ends.get(int(start), 0), int(end))
+    starts = sorted(ends)
+    periods = {}
+    for i, start in enumerate(starts):
+        end = min(ends[start], starts[i + 1]) if i + 1 < len(starts) else ends[start]
+        if end > start:
+            periods[start] = end
+    return periods or None
+
+
+def prorated_total(images, periods: dict, start_iso: str, end_iso: str, band_names):
+    """
+    Total over start_iso..end_iso (end exclusive) from multi-day images, each
+    counted by the share of its days that fall inside. None if no image does.
+    """
+    def _ms(iso):
+        return int(datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    a, b = _ms(start_iso), _ms(end_iso)
+    shares = {str(start): (min(end, b) - max(start, a)) / (end - start)
+              for start, end in periods.items() if min(end, b) > max(start, a)}
+    if not shares:
+        return None
+    lookup = ee.Dictionary(shares)
+    weighted = (images.filter(ee.Filter.inList("system:time_start", [int(k) for k in shares]))
+                # Cast: the shares differ, and with them the value range Earth Engine infers.
+                .map(lambda im: im.toDouble().multiply(ee.Number(
+                    lookup.get(ee.Number(im.get("system:time_start")).toLong().format("%d"))))))
+    return weighted.reduce(ee.Reducer.sum()).rename(band_names)
 
 
 # Gap filling: when cloud leaves holes in the requested period, they are
@@ -306,6 +374,20 @@ Required fields:
   median: reflectance and spectral indices (default). mean: temperature, LST, gas concentrations, night lights, soil moisture.
   sum: accumulated totals where every image is a total for its own period (daily/monthly rainfall in mm, 8-day ET). Never sum rates such as mm/hr.
   max: fire masks, peak values. mode: categorical data such as land cover classes.
+- "series": how many maps the request asks for. One of none | monthly | seasonal | annual | monthly_climatology | seasonal_climatology | custom.
+  none: ONE map of the whole period. This is the default - use it unless the request asks for several maps or a breakdown over time.
+  monthly: one map per calendar month between date_start and date_end ("monthly ET maps for 2025" -> 12 maps).
+  seasonal: one map per three-month season (Dec-Feb, Mar-May, Jun-Aug, Sep-Nov) in the period.
+  annual: one map per calendar year, for consecutive years ("annual rainfall maps 2015 to 2024", "yearly NDVI since 2019").
+  monthly_climatology: 12 maps, each calendar month averaged over several years ("average monthly rainfall 2001-2020", "monthly climatology", "long-term monthly mean").
+  seasonal_climatology: 4 maps, each season averaged over several years.
+  custom: specific periods to compare that are not consecutive months, seasons or years ("July 2015 vs July 2025", "2000, 2010 and 2020"). List them in "panels".
+  For every value except none: date_start and date_end span ALL the maps together, and temporal_reducer says how the images
+  inside EACH map's own period are combined. Use sum for a total per month / season / year - the default for rainfall and
+  evapotranspiration ("monthly ET" means the monthly total). Use mean when the user asks for the average of the values
+  ("monthly average temperature", "mean monthly LST", "average daily rainfall per month"). Use median for reflectance and indices.
+  For a climatology of rainfall or ET keep temporal_reducer "sum": the totals are averaged over the years automatically.
+- "panels": only for series "custom": list of {{"label": short name shown above the map, "date_start": "YYYY-MM-DD", "date_end": "YYYY-MM-DD"}}; [] otherwise.
 - "cloud_cover": integer 0-100 (default 85; irrelevant for SAR/DEM/static datasets)
 - "band_override": dict mapping spyndex variable letters OR role names to actual GEE band names.
   For SPYNDEX: include variable  band (e.g. {{"N":"B8","R":"B4","G":"B3","B":"B2"}})
@@ -356,16 +438,19 @@ returns nothing useful, fall back to your best-effort knowledge rather than bloc
 Examples:
 
 NDVI via MODIS (precomputed):
-{{"collection":"MODIS/061/MOD13Q1","index":"","map_type":"PRECOMPUTED","precomputed_band":"NDVI","precomputed_scale":0.0001,"region":"Sri Lanka","country":"Sri Lanka","country_iso3":"LKA","region_aliases":[],"admin_level":0,"bbox":[79.5,5.9,81.9,9.9],"date_start":"2024-01-01","date_end":"2024-03-31","temporal_reducer":"median","cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"MOD13Q1 has precomputed NDVI; used directly."}}
+{{"collection":"MODIS/061/MOD13Q1","index":"","map_type":"PRECOMPUTED","precomputed_band":"NDVI","precomputed_scale":0.0001,"region":"Sri Lanka","country":"Sri Lanka","country_iso3":"LKA","region_aliases":[],"admin_level":0,"bbox":[79.5,5.9,81.9,9.9],"date_start":"2024-01-01","date_end":"2024-03-31","temporal_reducer":"median","series":"none","panels":[],"cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"MOD13Q1 has precomputed NDVI; used directly."}}
 
 NDVI via Sentinel-2 (spyndex):
-{{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"NDVI","map_type":"SPYNDEX","precomputed_band":"","precomputed_scale":1.0,"region":"Germany","country":"Germany","country_iso3":"DEU","region_aliases":[],"admin_level":0,"bbox":[5.8,47.2,15.1,55.1],"date_start":"2024-06-01","date_end":"2024-08-31","temporal_reducer":"median","cloud_cover":20,"band_override":{{"N":"B8","R":"B4"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 has no precomputed NDVI; computing via spyndex."}}
+{{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"NDVI","map_type":"SPYNDEX","precomputed_band":"","precomputed_scale":1.0,"region":"Germany","country":"Germany","country_iso3":"DEU","region_aliases":[],"admin_level":0,"bbox":[5.8,47.2,15.1,55.1],"date_start":"2024-06-01","date_end":"2024-08-31","temporal_reducer":"median","series":"none","panels":[],"cloud_cover":20,"band_override":{{"N":"B8","R":"B4"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 has no precomputed NDVI; computing via spyndex."}}
 
 ET via MODIS (precomputed):
-{{"collection":"MODIS/061/MOD16A2GF","index":"","map_type":"PRECOMPUTED","precomputed_band":"ET","precomputed_scale":0.1,"region":"India","country":"India","country_iso3":"IND","region_aliases":[],"admin_level":0,"bbox":[68.1,6.5,97.4,35.7],"date_start":"2024-01-01","date_end":"2024-12-31","temporal_reducer":"sum","cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":1.0,"scale_offset":0.0,"notes":"MOD16A2GF provides precomputed ET."}}
+{{"collection":"MODIS/061/MOD16A2GF","index":"","map_type":"PRECOMPUTED","precomputed_band":"ET","precomputed_scale":0.1,"region":"India","country":"India","country_iso3":"IND","region_aliases":[],"admin_level":0,"bbox":[68.1,6.5,97.4,35.7],"date_start":"2024-01-01","date_end":"2024-12-31","temporal_reducer":"sum","series":"none","panels":[],"cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":1.0,"scale_offset":0.0,"notes":"MOD16A2GF provides precomputed ET."}}
+
+Monthly ET maps for one year (12 maps in one figure, each a monthly total):
+{{"collection":"MODIS/061/MOD16A2GF","index":"","map_type":"PRECOMPUTED","precomputed_band":"ET","precomputed_scale":0.1,"region":"Sri Lanka","country":"Sri Lanka","country_iso3":"LKA","region_aliases":[],"admin_level":0,"bbox":[79.5,5.9,81.9,9.9],"date_start":"2025-01-01","date_end":"2025-12-31","temporal_reducer":"sum","series":"monthly","panels":[],"cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":1.0,"scale_offset":0.0,"notes":"Monthly ET totals from the precomputed MOD16A2GF ET band, one map per month."}}
 
 RGB Sentinel-2:
-{{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"","map_type":"RGB","precomputed_band":"","precomputed_scale":1.0,"region":"Tokyo","country":"Japan","country_iso3":"JPN","region_aliases":[],"admin_level":1,"bbox":[138.9,35.5,139.95,35.9],"date_start":"2024-03-01","date_end":"2024-04-01","temporal_reducer":"median","cloud_cover":20,"band_override":{{"red":"B4","green":"B3","blue":"B2","nir":"B8","swir1":"B11","swir2":"B12"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 true-color composite."}}
+{{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"","map_type":"RGB","precomputed_band":"","precomputed_scale":1.0,"region":"Tokyo","country":"Japan","country_iso3":"JPN","region_aliases":[],"admin_level":1,"bbox":[138.9,35.5,139.95,35.9],"date_start":"2024-03-01","date_end":"2024-04-01","temporal_reducer":"median","series":"none","panels":[],"cloud_cover":20,"band_override":{{"red":"B4","green":"B3","blue":"B2","nir":"B8","swir1":"B11","swir2":"B12"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 true-color composite."}}
 """,
             agent=agent,
             expected_output="Valid JSON only",
@@ -425,6 +510,30 @@ RGB Sentinel-2:
                 ui.info(f"No period was given, so the last 12 months are used ({date_start} to {date_end}).")
         if date_end > today.isoformat():
             date_end = today.isoformat()
+        # ---------------- ONE MAP OR SEVERAL ----------------
+        # A series is split into its maps here; each entry of `panels` becomes
+        # one map of the figure. An empty list means the usual single map.
+        series_kind = normalise_series(params.get("series")) or infer_series_from_prompt(user_prompt)
+        panels, span_end = [], date_end
+        if series_kind:
+            custom_periods = params.get("panels") if isinstance(params.get("panels"), list) else []
+            panels = build_panels(series_kind, date_start, date_end, custom_periods, today)
+            if len(panels) > MAX_PANELS:
+                ui.error(
+                    f"This request would need **{len(panels)} maps** in one figure; more than {MAX_PANELS} "
+                    "are too small to read. No map was generated. Ask for a shorter period, or for "
+                    "seasonal or annual maps instead."
+                )
+                ui.stop()
+            if len(panels) < 2:
+                panels = []         # a "series" of one period is an ordinary map
+            else:
+                date_start = min(a for p in panels for a, _b in p["ranges"])
+                span_end = max(b for p in panels for _a, b in p["ranges"])      # exclusive
+                date_end = (date.fromisoformat(span_end) - timedelta(days=1)).isoformat()
+                for p in panels:
+                    if p.get("partial"):
+                        ui.info(f"**{p['label']}** is not over yet: its map covers the period up to today.")
         cloud_cover       = int(params.get("cloud_cover", 85))
         band_override     = params.get("band_override", {}) or {}
         agent_scale_f     = float(params.get("scale_factor", 1.0))
@@ -675,13 +784,16 @@ RGB Sentinel-2:
             except Exception:
                 img = ee.Image(cid)
             n_images = 1
+            if panels:
+                ui.info(f"`{cid}` is a single, undated dataset, so one map is shown instead of a series.")
+                panels = []
             if apply_cloud_removal:
                 ui.info("Cloud removal is not applicable to static datasets - skipped.")
         else:
             base_col = ee.ImageCollection(cid).filterBounds(region_geom)
             if "S1_GRD" in cid:
                 base_col = base_col.filter(ee.Filter.eq("instrumentMode", "IW"))
-            col = base_col.filterDate(date_start, date_end)
+            col = base_col.filterDate(date_start, span_end if panels else date_end)
             if cloud_prop:
                 col = col.filter(ee.Filter.lt(cloud_prop, cloud_cover))
 
@@ -730,13 +842,75 @@ RGB Sentinel-2:
             if single_band:
                 col = col.select(single_band)
             composite_bands = col.first().bandNames()
-            img = col.reduce(TEMPORAL_REDUCERS[reducer_name]()).rename(composite_bands)
+
+            def reduce_images(images):
+                return images.reduce(TEMPORAL_REDUCERS[reducer_name]()).rename(composite_bands)
+
+            if panels and period_note is None:
+                # How many images each map has (one request for all of them).
+                # Periods without any are left out rather than drawn empty.
+                counts = ee.List([[col.filterDate(a, b).size() for a, b in p["ranges"]]
+                                  for p in panels]).getInfo()
+                for p, per_range in zip(panels, counts):
+                    p["ranges"] = [r for r, n in zip(p["ranges"], per_range) if n > 0]
+                    p["n_images"] = sum(per_range)
+                empty = [p["label"] for p in panels if not p["ranges"]]
+                panels = [p for p in panels if p["ranges"]]
+                if empty:
+                    ui.info(f"`{cid}` has no images for {', '.join(empty)} - left out of the figure.")
+                if len(panels) < 2:
+                    ui.info("Only one of the requested periods has images, so a single map is shown.")
+                    panels = []
+            else:
+                panels = []
+
+            image_periods = None      # set when totals are divided between periods by days
+            if panels:
+                if reducer_name == "sum":
+                    # An image that starts just before the first period may
+                    # still reach into it.
+                    lead = base_col.filterDate(
+                        (date.fromisoformat(date_start) - timedelta(days=32)).isoformat(), date_start)
+                    if cloud_prop:
+                        lead = lead.filter(ee.Filter.lt(cloud_prop, cloud_cover))
+                    if cloud_removal_applied:
+                        lead = apply_cloud_mask(lead, cid)
+                    if single_band:
+                        lead = lead.select(single_band)
+                    with_lead = lead.merge(col)
+                    image_periods = multi_day_periods(with_lead)
+
+                def period_composite(a, b):
+                    total = (prorated_total(with_lead, image_periods, a, b, composite_bands)
+                             if image_periods else None)
+                    return total if total is not None else reduce_images(col.filterDate(a, b))
+
+                for p in panels:
+                    ranges = p["ranges"]
+                    if len(ranges) == 1:
+                        p["raw"] = period_composite(*ranges[0])
+                    elif reducer_name == "sum":
+                        # Climatology of a total: the total of each year's
+                        # period, then the average of those totals. Summing
+                        # all the years together would give a multi-year total.
+                        p["raw"] = ee.ImageCollection.fromImages(
+                            [period_composite(a, b) for a, b in ranges]).mean()
+                    else:
+                        p["raw"] = reduce_images(col.filter(ee.Filter.Or(*[ee.Filter.date(a, b) for a, b in ranges])))
+                # Stand-in for "the image" wherever one is needed to describe
+                # the data as a whole: it has data wherever any of the maps does.
+                img = ee.ImageCollection.fromImages([p["raw"] for p in panels]).mosaic()
+                n_images = sum(p["n_images"] for p in panels)
+            else:
+                img = reduce_images(col)
 
             # ---------------- GAP FILLING ----------------
             # Totals are not filled: adding rain from other months would change
             # what the number means. A period that was already replaced by the
             # nearest available image is left alone too.
-            fill_wanted = (fill_gaps_option and reducer_name != "sum" and period_note is None
+            # Nor are the maps of a series: each must show its own period only,
+            # or the comparison between them means nothing.
+            fill_wanted = (fill_gaps_option and reducer_name != "sum" and period_note is None and not panels
                            and not any(k in user_prompt.lower() for k in GAP_FILL_OPT_OUT))
             if fill_wanted:
                 try:
@@ -796,7 +970,8 @@ RGB Sentinel-2:
 
         status_col.update(
             label=(f"Dataset loaded ({n_images} image{'s' if n_images != 1 else ''}"
-                   + ("" if is_static or n_images == 1 else f", {reducer_name} composite") + ")"
+                   + (f", {len(panels)} maps" if panels else
+                      "" if is_static or n_images == 1 else f", {reducer_name} composite") + ")"
                    + (" - Cloud masked" if cloud_removal_applied else "")),
             state="complete"
         )
@@ -825,6 +1000,7 @@ RGB Sentinel-2:
                 display_label = band_display_label(meta, class_band) if class_meta else class_band
             title_label = display_label
             class_filter_applied = False
+            snap_values = None
             if not has_class_schema:
                 # No class list in the catalog: build one from the values in
                 # the data, named from the band description where it spells
@@ -834,11 +1010,18 @@ RGB Sentinel-2:
                 if found:
                     schema_key = register_detected_classes(cid, class_band, found, class_meta.get("text_classes"))
                     has_class_schema = True
+                    snap_values = found
                     class_img = snap_to_values(class_img, found)
                     if any(entry["label"] == f"Class {value}"
                            for value, entry in LULC_CLASS_SCHEMAS[schema_key].items()):
                         ui.caption(f"`{cid}` publishes no class names for `{class_band}` - "
                                    "classes are labelled by their value.")
+
+            def class_codes(raw):
+                """The dataset's own class codes of a composite."""
+                codes = raw.select(class_band)
+                return snap_to_values(codes, snap_values) if snap_values else codes
+
             if has_class_schema:
                 lulc_class_values = detect_lulc_class_filter(user_prompt, schema_key,
                                                              require_only=not is_landcover)
@@ -851,14 +1034,17 @@ RGB Sentinel-2:
                     ui.info("Showing only: **" + ", ".join(
                         LULC_CLASS_SCHEMAS[schema_key][v]["label"] for v in lulc_class_values) + "**")
                 else:
-                    # Legend lists only the classes that occur in this region.
+                    # Legend lists only the classes that occur in this region
+                    # (in any of the maps, for a series).
                     try:
-                        hist = class_img.reduceRegion(
+                        counted = (ee.Image.cat([class_codes(p["raw"]).rename([f"p{i}"])
+                                                 for i, p in enumerate(panels)]) if panels else class_img)
+                        hists = counted.reduceRegion(
                             reducer=ee.Reducer.frequencyHistogram(), geometry=region_geom,
                             scale=max(float((meta or {}).get("gsd") or 100), 100),
                             bestEffort=True, maxPixels=1e9,
-                        ).get(class_band).getInfo() or {}
-                        present = {int(float(k)) for k in hist}
+                        ).getInfo() or {}
+                        present = {int(float(k)) for hist in hists.values() for k in (hist or {})}
                         lulc_class_values = [v for v in LULC_CLASS_SCHEMAS[schema_key] if v in present]
                     except Exception:
                         lulc_class_values = []
@@ -879,6 +1065,14 @@ RGB Sentinel-2:
                     clip_to_region(result_img), "LANDCOVER", region_geom,
                     vis_params_gee["palette"], vis_params_gee["min"], vis_params_gee["max"]) or None
                 ui.caption(f"`{cid}` publishes no class names - classes are labelled by their numeric value.")
+
+            def to_display(raw):
+                """The image drawn on the map, from a composite of the dataset's bands."""
+                if has_class_schema:
+                    return class_codes(raw).remap(
+                        display_classes, list(range(len(display_classes)))).rename("LANDCOVER")
+                return class_codes(raw).rename("LANDCOVER")
+
             final_img = clip_to_region(result_img)
             map_label = "LANDCOVER" if is_landcover else class_band
 
@@ -889,18 +1083,24 @@ RGB Sentinel-2:
                 band_offset = float(band_meta.get("offset") or 0.0)
             else:
                 band_scale, band_offset = float(params.get("precomputed_scale") or 1.0), 0.0
-            result_img = img.select(requested_band)
-            if band_scale != 1.0:
-                result_img = result_img.multiply(band_scale)
-            if band_offset != 0.0:
-                result_img = result_img.add(band_offset)
-            result_img = result_img.rename(requested_band)
-
             # Temperatures are published in kelvin; maps read better in Celsius.
             band_units = band_meta.get("units", "")
-            if band_units in ("K", "Kelvin", "kelvin"):
-                result_img  = result_img.subtract(273.15).rename(requested_band)
-                band_units  = "deg C"
+            kelvin = band_units in ("K", "Kelvin", "kelvin")
+            if kelvin:
+                band_units = "deg C"
+
+            def to_display(raw):
+                """The image drawn on the map, from a composite of the dataset's bands."""
+                out = raw.select(requested_band)
+                if band_scale != 1.0:
+                    out = out.multiply(band_scale)
+                if band_offset != 0.0:
+                    out = out.add(band_offset)
+                if kelvin:
+                    out = out.subtract(273.15)
+                return out.rename(requested_band)
+
+            result_img = to_display(img)
 
             palette_key = (theme_key or PRECOMPUTED_PALETTE_MAP.get(requested_band)
                            or (requested_band.upper() if requested_band.upper() in INDEX_PALETTES else None)
@@ -933,10 +1133,13 @@ RGB Sentinel-2:
             map_label      = requested_band
 
         elif map_type == "SPYNDEX" and index_name:
-            result_img = compute_spyndex_on_gee(
-                img, cid, index_name, band_map, scale_cfg,
-                band_override=band_override or None
-            )
+            def to_display(raw):
+                return compute_spyndex_on_gee(
+                    raw, cid, index_name, band_map, scale_cfg,
+                    band_override=band_override or None
+                )
+
+            result_img = to_display(img)
             if result_img is None:
                 ui.error(
                     f"**{index_name}** could not be computed from `{cid}`: the index is unknown or the "
@@ -953,11 +1156,17 @@ RGB Sentinel-2:
             map_label      = index_name
 
         else:
-            result_img, vis_params_raw = compute_special_map(
-                img, map_type, cid, band_map, scale_cfg,
-                available_bands=bands,
-                preferred_band=requested_band or None,
-            )
+            def special_map(raw):
+                return compute_special_map(
+                    raw, map_type, cid, band_map, scale_cfg,
+                    available_bands=bands,
+                    preferred_band=requested_band or None,
+                )
+
+            def to_display(raw):
+                return special_map(raw)[0]
+
+            result_img, vis_params_raw = special_map(img)
             display_label  = INDEX_PALETTES.get(map_type, {}).get("label", map_type)
             title_label    = MAP_TYPE_TITLES.get(map_type, map_type)
             vis_params_gee = {k: v for k, v in vis_params_raw.items() if k != "label"}
@@ -966,6 +1175,11 @@ RGB Sentinel-2:
             map_label      = map_type
 
         is_rgb = "bands" in vis_params_gee and len(vis_params_gee["bands"]) == 3
+        value_band = vis_params_gee.get("bands", [map_label])[0]
+
+        # Every map of a series is computed exactly as the single map is.
+        for p in panels:
+            p["image"] = clip_to_region(to_display(p["raw"]))
 
         # Fit the display range to the data in this region. Fixed ranges are kept
         # only where the range is physically meaningful (indices, percentages).
@@ -975,12 +1189,25 @@ RGB Sentinel-2:
             if stretch:
                 vis_params_gee["min"], vis_params_gee["max"] = stretch["min"], stretch["max"]
         elif auto_range or (reducer_name == "sum" and not is_static and not is_categorical):
-            auto = auto_vis_params(final_img, vis_params_gee.get("bands", [map_label])[0], region_geom)
+            # One range for all the maps of a series, so that a colour means
+            # the same value on each of them.
+            auto = ((shared_vis_range([p["image"] for p in panels], value_band, region_geom) if panels else None)
+                    or auto_vis_params(final_img, value_band, region_geom))
             if auto["max"] > auto["min"]:
                 vis_params_gee["min"], vis_params_gee["max"] = auto["min"], auto["max"]
         if reducer_name == "sum" and not is_static and not is_categorical and n_images > 1:
-            display_label = "Total " + re.sub(r"\s*/\s*(d|day)\)", ")", str(display_label))
-            title_label   = "Total " + title_label[0].lower() + title_label[1:]
+            # A total over a period is no longer "per day" or "per 8 days".
+            display_label = "Total " + re.sub(r"\s*/\s*(\d+\s*-?\s*)?(d|day|days|month)\)", ")", str(display_label))
+            if not panels:
+                title_label = "Total " + title_label[0].lower() + title_label[1:]
+            elif series_kind in CLIMATOLOGIES:
+                display_label = "Mean t" + display_label[1:]
+        # The title of a series says what each map is (monthly total, annual
+        # mean, long-term monthly mean, ...); colour composites and class
+        # maps have no such statistic to name.
+        plain_series = is_rgb or is_categorical
+        if panels:
+            title_label = series_title(series_kind, reducer_name, title_label, plain_series)
 
         # Apply sidebar palette override
         palette_override = PALETTE_PRESETS.get(selected_palette)
@@ -1015,7 +1242,34 @@ RGB Sentinel-2:
         # Computed from the same image that is drawn, so numbers and map agree.
         stats, stats_lines, class_shares = None, None, None
         legend_without_shares = [dict(entry) for entry in lulc_legend] if lulc_legend else None
-        if not is_rgb:
+        if panels:
+            # The same figures for every map, side by side.
+            if not is_rgb:
+                status_stats = ui.status(f"Computing statistics for {len(panels)} maps", expanded=False)
+                stats_scale = max(float((meta or {}).get("gsd") or 30), 10)
+                panel_images = [p["image"] for p in panels]
+                panel_labels = [ascii_label(p["label"]) for p in panels]
+                if is_categorical:
+                    position_labels = ({i: LULC_CLASS_SCHEMAS[schema_key][v]["label"]
+                                        for i, v in enumerate(display_classes)} if has_class_schema else None)
+                    stats = series_class_stats(panel_images, panel_labels, "LANDCOVER", region_geom,
+                                               position_labels, stats_scale, share_of_region=class_filter_applied)
+                    if stats:
+                        if has_class_schema:
+                            for row in stats["rows"]:
+                                row["value"] = display_classes[row["value"]]
+                                row["color"] = LULC_CLASS_SCHEMAS[schema_key][row["value"]]["color"]
+                        class_shares = {row["class"]: sum(row["percent"]) / len(row["percent"])
+                                        for row in stats["rows"]}
+                else:
+                    stats = series_stats(panel_images, panel_labels, value_band, region_geom, stats_scale)
+                    for p, row in zip(panels, (stats or {}).get("rows", [])):
+                        if row["mean"] is not None:
+                            p["note"] = f"mean {format_value(row['mean'])}"
+                status_stats.update(
+                    label="Statistics computed" if stats else "Statistics could not be computed",
+                    state="complete" if stats else "error")
+        elif not is_rgb:
             status_stats = ui.status("Computing statistics for the region", expanded=False)
             stats_scale = max(float((meta or {}).get("gsd") or 30), 10)
             if is_categorical:
@@ -1037,7 +1291,7 @@ RGB Sentinel-2:
                             entry["label"] += f" ({pct:.1f}%)" if pct >= 0.05 else " (<0.1%)"
             else:
                 stats = continuous_stats(
-                    final_img, vis_params_gee.get("bands", [map_label])[0], region_geom,
+                    final_img, value_band, region_geom,
                     float(vis_params_gee.get("min", 0)), float(vis_params_gee.get("max", 1)), stats_scale)
                 if stats:
                     s = dict(stats["rows"])
@@ -1069,9 +1323,23 @@ RGB Sentinel-2:
         status_thumb = ui.status("Rendering map image on Earth Engine", expanded=True)
         # Composites of many hundreds of images are too slow at full size.
         target_px = 2048 if n_images <= 400 else 1024
-        map_pil, final_dim = fetch_thumbnail_with_retry(
-            final_img, vis_params_gee, extent, projection["crs"], target_long_side=target_px)
-        status_thumb.update(label=f"Map image rendered at {final_dim}px", state="complete")
+        if panels:
+            # The grid is chosen from the shape of the region, and each map is
+            # rendered at the size it will be printed at.
+            layout = choose_grid_layout(len(panels), (extent[1] - extent[0]) / max(extent[3] - extent[2], 1e-9))
+            target_px = layout["panel_px"]
+            status_thumb.update(label=f"Rendering {len(panels)} maps on Earth Engine")
+            panel_pils = fetch_panel_thumbnails(
+                [p["image"] for p in panels], vis_params_gee, extent, projection["crs"], target_px,
+                on_panel=lambda done, total: status_thumb.update(
+                    label=f"Rendering maps on Earth Engine ({done} of {total})"))
+            status_thumb.update(
+                label=f"{len(panels)} maps rendered ({layout['cols']} x {layout['rows']} grid, {target_px}px each)",
+                state="complete")
+        else:
+            map_pil, final_dim = fetch_thumbnail_with_retry(
+                final_img, vis_params_gee, extent, projection["crs"], target_long_side=target_px)
+            status_thumb.update(label=f"Map image rendered at {final_dim}px", state="complete")
 
         if cloud_removal_applied:
             engine_lbl = "Cloud masked"
@@ -1085,7 +1353,12 @@ RGB Sentinel-2:
         status_render = ui.status("Rendering cartographic layout", expanded=True)
 
         # Title, period line and credit block
-        if is_static:
+        if panels:
+            subtitle = series_subtitle(series_kind, panels)
+            processing = (series_processing(series_kind, reducer_name, n_images, plain_series)
+                          + (": " + ", ".join(ascii_label(p["label"]) for p in panels) if series_kind == "custom"
+                             else f", {date_start} to {date_end}"))
+        elif is_static:
             if meta and meta["date_start"]:
                 y0, y1 = meta["date_start"][:4], meta["date_end"][:4]
                 # A period ending on 1 January belongs to the year before.
@@ -1105,6 +1378,10 @@ RGB Sentinel-2:
             processing += f"; cloud masking: {cloud_mask_desc}"
         if cloud_prop and not is_static:
             processing += f"; scenes under {cloud_cover}% cloud"
+        if panels:
+            if image_periods:
+                processing += "; images spanning two periods are divided between them by days"
+            processing += "; all maps share one extent and one colour scale"
         processing_original = processing
         if gap_fill:
             processing += (f"; cloud gaps filled with imagery from {gap_fill['window_start']} to "
@@ -1136,7 +1413,13 @@ RGB Sentinel-2:
             credit_lines     = credit_lines,
             stats_lines      = stats_lines,
         )
-        rendered = render_cartographic_figure(map_pil_image=map_pil, **render_kwargs)
+        if panels:
+            rendered = render_composite_figure(
+                panels=[{"image": pil, "label": p["label"], "note": p.get("note")}
+                        for p, pil in zip(panels, panel_pils)],
+                layout=layout, **render_kwargs)
+        else:
+            rendered = render_cartographic_figure(map_pil_image=map_pil, **render_kwargs)
 
         # The original, unfilled map: the same result with the filled pixels
         # masked out again. It is rendered only if the user asks for it.
@@ -1162,14 +1445,23 @@ RGB Sentinel-2:
         # codes), in the map projection. Only the link is prepared here; the
         # file is downloaded when the user asks for it.
         export_img = clip_to_region(class_img) if is_categorical else final_img.toFloat()
+        if panels:
+            # One band per map (three for colour composites), named after it.
+            out_bands = vis_params_gee["bands"] if is_rgb else [None]
+            export_img = ee.Image.cat([
+                (clip_to_region(class_codes(p["raw"])) if is_categorical
+                 else p["image"].select(vis_params_gee["bands"] if is_rgb else [value_band]).toFloat()
+                 ).rename(["_".join(filter(None, (re.sub(r"[^A-Za-z0-9]+", "_", ascii_label(p["label"])).strip("_"), b)))
+                           for b in out_bands])
+                for p in panels])
         geotiff = geotiff_download(
-            export_img, extent, projection, n_bands=3 if is_rgb else 1,
+            export_img, extent, projection, n_bands=(3 if is_rgb else 1) * max(len(panels), 1),
             native_scale_m=(meta or {}).get("gsd"),
             lat_mid=(geo_bounds["lat_min"] + geo_bounds["lat_max"]) / 2.0)
 
         # Keep the finished map in the session: Streamlit reruns this script on
         # every click (including "Download"), and the map must survive that.
-        suffix = "_cloudmasked" if cloud_removal_applied else ""
+        suffix = (f"_{series_kind}" if panels else "") + ("_cloudmasked" if cloud_removal_applied else "")
         result_data = {
             "png_bytes":  rendered["png"],
             "pdf_bytes":  rendered["pdf"],
@@ -1203,6 +1495,10 @@ RGB Sentinel-2:
             "file_name":  f"{ascii_label(map_label)}_{ascii_label(region_name).replace(' ','_')}_{date_start[:4]}{suffix}.png",
             "index_info": None,
             "cloud_mask_desc": cloud_mask_desc,
+            # Multi-map figures: the kind of series and its maps, in reading order.
+            "series":     series_kind if panels else None,
+            "panels":     [{"label": ascii_label(p["label"]), "images": p["n_images"]} for p in panels],
+            "grid":       f"{layout['cols']} x {layout['rows']}" if panels else None,
         }
         if map_type == "SPYNDEX" and SPYNDEX_AVAILABLE and index_name in spyndex.indices:
             idx_info = spyndex.indices[index_name]

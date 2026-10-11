@@ -49,7 +49,8 @@ Gee-Luma/
     ├── class_legend.py      # Class legends for classified bands of any dataset
     ├── projection.py        # Chooses a map projection for the region
     ├── thumbnail.py         # Tiled, parallel high-resolution image fetch
-    ├── cartography.py       # Final map layout (PNG and PDF)
+    ├── time_series.py       # Splits a period into the maps of a multi-map figure
+    ├── cartography.py       # Final map layout, single and multi-map (PNG and PDF)
     ├── map_stats.py         # Region statistics and CSV export
     ├── exports.py           # GeoTIFF export of the data values
     ├── styles.py            # CSS and header HTML for the Streamlit page
@@ -116,10 +117,45 @@ Run `npm run build` again to update what `server.py` serves.
 - **Categorical products**: land cover and any other classified band, with the
   dataset's own class names and colours
 - **Totals and averages** over a period (e.g. total rainfall for a year)
+- **Several maps in one figure** — a map per month, season or year, a multi-year
+  climatology, or named periods side by side (see below)
 - **Any region**: a country, province/state or district anywhere; an uploaded GeoJSON
   (any CRS); or a larger area such as a continent
 
 Vector (table) datasets are not supported yet.
+
+## Several maps in one figure
+
+Ask for more than one period and the maps are drawn together, on one page:
+
+| Request                                              | Figure                                                        |
+|------------------------------------------------------|---------------------------------------------------------------|
+| "Monthly ET maps of Sri Lanka for 2025"              | 12 maps, each the total of one month                          |
+| "Monthly average land surface temperature, 2024"     | 12 maps, each the mean of one month                           |
+| "Seasonal NDVI of Nepal for 2024"                    | 4 maps: Dec–Feb, Mar–May, Jun–Aug, Sep–Nov                    |
+| "Annual rainfall maps of Kenya, 2015 to 2024"        | 10 maps, each the total of one year                           |
+| "Average monthly rainfall of India, 2001–2020"       | 12 maps: each calendar month's total, averaged over 20 years  |
+| "NDVI of Punjab in July 2015 vs July 2025"           | 2 maps, the periods named                                     |
+
+- **What each map holds** follows the request and the variable: a *total* per period for
+  rainfall and evapotranspiration, a *mean* when an average is asked for, a median for
+  reflectance and indices, the most common class for classified data. A climatology of
+  totals is the average of each year's total, not one total over all the years. The
+  title, legend and credit block say which it is.
+- **The grid** is chosen from the shape of the region so the maps are drawn as large
+  as the page allows: twelve maps of a tall region become 6 × 2, of a wide region
+  3 × 4, of a compact one 4 × 3.
+- **Comparable by construction**: every map has the same extent, projection and colour
+  scale (fitted to all of them together), under one shared legend and scale bar.
+- Whole calendar units are mapped: a period that covers less than half of a month,
+  season or year does not get a map of it. A period still running ends today, and
+  periods with no images are left out; both are reported.
+- Cloud gaps are not filled in a series (each map shows its own period only), and a
+  figure holds at most 36 maps.
+- Statistics are given per map, the CSV has a row per map, and the GeoTIFF has one
+  band per map.
+
+A request for a single period still produces the single-map layout described next.
 
 ## The map
 

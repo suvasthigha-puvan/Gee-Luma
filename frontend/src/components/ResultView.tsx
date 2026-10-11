@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CalendarDays, CloudOff, Download, FileImage, FileSpreadsheet, FileText, Grid3x3, Layers, Loader2, Satellite } from "lucide-react";
+import { CalendarDays, CloudOff, Download, FileImage, FileSpreadsheet, FileText, Grid3x3, LayoutGrid, Layers, Loader2, Satellite } from "lucide-react";
 import { api } from "../api";
 import type { Job, MapResult } from "../types";
 import { MapViewer } from "./MapViewer";
@@ -64,6 +64,11 @@ export function ResultView({ job, result, onJobChange }: Props) {
           {result.period && (
             <span className="chip">
               <CalendarDays size={13} /> {result.period}
+            </span>
+          )}
+          {result.series && (
+            <span className="chip">
+              <LayoutGrid size={13} /> {result.series.maps.length} maps
             </span>
           )}
           <span className="chip">
@@ -142,7 +147,8 @@ export function ResultView({ job, result, onJobChange }: Props) {
           {result.geotiff.resampled
             ? ` (resampled from ${result.geotiff.native_scale_m.toLocaleString("en-US")} m to fit Earth Engine's download limit)`
             : ""}
-          .{fill ? " Statistics and GeoTIFF describe the gap-filled map." : ""}
+          .{result.series ? " It has one band per map." : ""}
+          {fill ? " Statistics and GeoTIFF describe the gap-filled map." : ""}
         </p>
       )}
 
