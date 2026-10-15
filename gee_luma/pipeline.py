@@ -108,7 +108,7 @@ from gee_luma.map_stats import (
 )
 from gee_luma.units import whole_period, relabel_units
 from gee_luma.time_series import (
-    CLIMATOLOGIES, MAX_PANELS, normalise_series, infer_series_from_prompt, build_panels,
+    CLIMATOLOGIES, MAX_PANELS, normalise_series, infer_series_from_prompt, refine_series, build_panels,
     series_title, series_subtitle, series_processing,
 )
 from gee_luma.class_legend import (
@@ -396,13 +396,18 @@ Required fields:
   median: reflectance and spectral indices (default). mean: temperature, LST, gas concentrations, night lights, soil moisture.
   sum: accumulated totals where every image is a total for its own period (daily/monthly rainfall in mm, 8-day ET). Never sum rates such as mm/hr.
   max: fire masks, peak values. mode: categorical data such as land cover classes.
-- "series": how many maps the request asks for. One of none | monthly | seasonal | annual | monthly_climatology | seasonal_climatology | custom.
+- "series": how many maps the request asks for. One of none | monthly | seasonal | annual | monthly_climatology | seasonal_climatology | annual_climatology | custom.
+  Read the research terms in "Rule 10 - Research terms for time" of the knowledge base before choosing. KEY DISTINCTION:
+  "monthly X from 2020 to 2025" = every month of every year (72 maps); "long-term / average / mean monthly X from 2020 to 2025"
+  = the 12 calendar months, each averaged over the years (all Januaries together, all Februaries together, ...) = monthly_climatology.
   none: ONE map of the whole period. This is the default - use it unless the request asks for several maps or a breakdown over time.
   monthly: one map per calendar month between date_start and date_end ("monthly ET maps for 2025" -> 12 maps).
   seasonal: one map per three-month season (Dec-Feb, Mar-May, Jun-Aug, Sep-Nov) in the period.
   annual: one map per calendar year, for consecutive years ("annual rainfall maps 2015 to 2024", "yearly NDVI since 2019").
   monthly_climatology: 12 maps, each calendar month averaged over several years ("average monthly rainfall 2001-2020", "monthly climatology", "long-term monthly mean").
   seasonal_climatology: 4 maps, each season averaged over several years.
+  annual_climatology: ONE map of the average year over several years ("mean annual rainfall 2001-2020", "long-term annual average ET",
+    "average annual NDVI 2015-2024"). For rainfall/ET keep temporal_reducer "sum": each year's total is averaged over the years.
   custom: specific periods to compare that are not consecutive months, seasons or years ("July 2015 vs July 2025", "2000, 2010 and 2020"). List them in "panels".
   For every value except none: date_start and date_end span ALL the maps together, and temporal_reducer says how the images
   inside EACH map's own period are combined. Use sum for a total per month / season / year - the default for rainfall and
@@ -470,6 +475,12 @@ ET via MODIS (precomputed):
 
 Monthly ET maps for one year (12 maps in one figure, each a monthly total):
 {{"collection":"MODIS/061/MOD16A2GF","index":"","map_type":"PRECOMPUTED","precomputed_band":"ET","precomputed_scale":0.1,"region":"Sri Lanka","country":"Sri Lanka","country_iso3":"LKA","region_aliases":[],"admin_level":0,"bbox":[79.5,5.9,81.9,9.9],"date_start":"2025-01-01","date_end":"2025-12-31","temporal_reducer":"sum","series":"monthly","panels":[],"cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":1.0,"scale_offset":0.0,"notes":"Monthly ET totals from the precomputed MOD16A2GF ET band, one map per month."}}
+
+Long-term monthly average ET over several years (12 maps: all Januaries averaged, all Februaries averaged, ...):
+{{"collection":"MODIS/061/MOD16A2GF","index":"","map_type":"PRECOMPUTED","precomputed_band":"ET","precomputed_scale":0.1,"region":"Jaffna","country":"Sri Lanka","country_iso3":"LKA","region_aliases":[],"admin_level":2,"bbox":[79.8,9.4,80.4,9.85],"date_start":"2020-01-01","date_end":"2025-12-31","temporal_reducer":"sum","series":"monthly_climatology","panels":[],"cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":1.0,"scale_offset":0.0,"notes":"Monthly ET totals from MOD16A2GF, each calendar month averaged over 2020-2025 (climatology)."}}
+
+Mean annual rainfall over several years (one map of the average yearly total):
+{{"collection":"UCSB-CHG/CHIRPS/DAILY","index":"","map_type":"PRECIPITATION","precomputed_band":"precipitation","precomputed_scale":1.0,"region":"Sri Lanka","country":"Sri Lanka","country_iso3":"LKA","region_aliases":[],"admin_level":0,"bbox":[79.5,5.9,81.9,9.9],"date_start":"2001-01-01","date_end":"2020-12-31","temporal_reducer":"sum","series":"annual_climatology","panels":[],"cloud_cover":85,"band_override":{{}},"is_temporal":true,"scale_factor":1.0,"scale_offset":0.0,"notes":"Annual CHIRPS totals averaged over 2001-2020 (mean annual precipitation)."}}
 
 RGB Sentinel-2:
 {{"collection":"COPERNICUS/S2_SR_HARMONIZED","index":"","map_type":"RGB","precomputed_band":"","precomputed_scale":1.0,"region":"Tokyo","country":"Japan","country_iso3":"JPN","region_aliases":[],"admin_level":1,"bbox":[138.9,35.5,139.95,35.9],"date_start":"2024-03-01","date_end":"2024-04-01","temporal_reducer":"median","series":"none","panels":[],"cloud_cover":20,"band_override":{{"red":"B4","green":"B3","blue":"B2","nir":"B8","swir1":"B11","swir2":"B12"}},"is_temporal":true,"scale_factor":0.0001,"scale_offset":0.0,"notes":"Sentinel-2 true-color composite."}}
@@ -539,15 +550,30 @@ RGB Sentinel-2:
         # A series is split into its maps here; each entry of `panels` becomes
         # one map of the figure. An empty list means the usual single map.
         series_kind = normalise_series(params.get("series")) or infer_series_from_prompt(user_prompt)
+        series_kind, series_note = refine_series(series_kind, user_prompt, date_start, date_end)
+        if series_note:
+            ui.info(series_note)
         panels, span_end = [], date_end
+        # Mean annual value over several years (one map): the whole years of
+        # the period, each composited on its own and then averaged.
+        annual_ranges = []
+        if series_kind == "annual_climatology":
+            series_kind = None
+            years = [p for p in build_panels("annual", date_start, date_end, None, today) if not p.get("partial")]
+            if len(years) >= 2:
+                annual_ranges = [r for p in years for r in p["ranges"]]
+                date_start = annual_ranges[0][0]
+                span_end = annual_ranges[-1][1]
+                date_end = (date.fromisoformat(span_end) - timedelta(days=1)).isoformat()
         if series_kind:
             custom_periods = params.get("panels") if isinstance(params.get("panels"), list) else []
             panels = build_panels(series_kind, date_start, date_end, custom_periods, today)
             if len(panels) > MAX_PANELS:
                 ui.error(
                     f"This request would need **{len(panels)} maps** in one figure; more than {MAX_PANELS} "
-                    "are too small to read. No map was generated. Ask for a shorter period, or for "
-                    "seasonal or annual maps instead."
+                    "are too small to read. No map was generated. Ask for a shorter period, for "
+                    "seasonal or annual maps, or for a long-term monthly average (12 maps, each "
+                    "calendar month averaged over the years)."
                 )
                 ui.stop()
             if len(panels) < 2:
@@ -698,6 +724,8 @@ RGB Sentinel-2:
             ui.markdown(f"**Bands:** `{', '.join(bands)}`")
 
         is_static  = resolve_is_static(cid, col_info, agent_is_temporal)
+        if is_static:
+            annual_ranges = []      # one undated image: nothing to average over years
         cloud_prop = detect_cloud_prop(cid, col_info)
         band_map   = get_dataset_band_map(cid, band_override, col_info)
         scale_cfg  = get_scale_config(cid, agent_scale_f, agent_scale_o)
@@ -818,7 +846,7 @@ RGB Sentinel-2:
             base_col = ee.ImageCollection(cid).filterBounds(region_geom)
             if "S1_GRD" in cid:
                 base_col = base_col.filter(ee.Filter.eq("instrumentMode", "IW"))
-            col = base_col.filterDate(date_start, span_end if panels else date_end)
+            col = base_col.filterDate(date_start, span_end if panels or annual_ranges else date_end)
             if cloud_prop:
                 col = col.filter(ee.Filter.lt(cloud_prop, cloud_cover))
 
@@ -889,8 +917,16 @@ RGB Sentinel-2:
             else:
                 panels = []
 
+            if annual_ranges and (period_note is not None or reducer_name != "sum"):
+                # Only a total needs the years composited one by one; the
+                # mean (median, ...) of all the images already is the long-term one.
+                annual_ranges = [] if period_note is not None else annual_ranges
+            elif annual_ranges:
+                counts = ee.List([col.filterDate(a, b).size() for a, b in annual_ranges]).getInfo()
+                annual_ranges = [r for r, n in zip(annual_ranges, counts) if n > 0]
+
             image_periods = None      # set when totals are divided between periods by days
-            if panels:
+            if panels or (annual_ranges and reducer_name == "sum"):
                 if reducer_name == "sum":
                     # An image that starts just before the first period may
                     # still reach into it.
@@ -910,6 +946,11 @@ RGB Sentinel-2:
                              if image_periods else None)
                     return total if total is not None else reduce_images(col.filterDate(a, b))
 
+            if annual_ranges and reducer_name == "sum" and not panels:
+                # Mean annual total: the total of each year, then the average
+                # of those totals (not the multi-year sum).
+                img = ee.ImageCollection.fromImages([period_composite(a, b) for a, b in annual_ranges]).mean()
+            elif panels:
                 for p in panels:
                     ranges = p["ranges"]
                     if len(ranges) == 1:
@@ -1227,6 +1268,8 @@ RGB Sentinel-2:
             if panels:
                 unit_period = {"monthly": "month", "monthly_climatology": "month", "seasonal": "season",
                                "seasonal_climatology": "season", "annual": "year"}.get(series_kind)
+            elif annual_ranges:
+                unit_period = "year"
             else:
                 unit_period = whole_period(date_start, date_end)
             display_label = relabel_units(
@@ -1234,7 +1277,9 @@ RGB Sentinel-2:
                 hint=f"{title_label} {map_label} {theme_key or ''}")
         if reducer_name == "sum" and not is_static and not is_categorical and n_images > 1:
             display_label = "Total " + str(display_label)
-            if not panels:
+            if annual_ranges:
+                display_label = "Mean t" + display_label[1:]
+            elif not panels:
                 title_label = "Total " + title_label[0].lower() + title_label[1:]
             elif series_kind in CLIMATOLOGIES:
                 display_label = "Mean t" + display_label[1:]
@@ -1244,6 +1289,8 @@ RGB Sentinel-2:
         plain_series = is_rgb or is_categorical
         if panels:
             title_label = series_title(series_kind, reducer_name, title_label, plain_series)
+        elif annual_ranges:
+            title_label = series_title("annual_climatology", reducer_name, title_label, plain_series)
 
         # Apply sidebar palette override
         palette_override = PALETTE_PRESETS.get(selected_palette)
@@ -1394,6 +1441,11 @@ RGB Sentinel-2:
             processing = (series_processing(series_kind, reducer_name, n_images, plain_series)
                           + (": " + ", ".join(ascii_label(p["label"]) for p in panels) if series_kind == "custom"
                              else f", {date_start} to {date_end}"))
+        elif annual_ranges:
+            n_years = len(annual_ranges)
+            subtitle = f"Average over {date_start[:4]} to {date_end[:4]} ({n_years} years)"
+            processing = (series_processing("annual_climatology", reducer_name, n_images, plain_series)
+                          + f", {date_start} to {date_end}")
         elif is_static:
             if meta and meta["date_start"]:
                 y0, y1 = meta["date_start"][:4], meta["date_end"][:4]
@@ -1532,7 +1584,7 @@ RGB Sentinel-2:
             "index_info": None,
             "cloud_mask_desc": cloud_mask_desc,
             # Multi-map figures: the kind of series and its maps, in reading order.
-            "series":     series_kind if panels else None,
+            "series":     series_kind if panels else ("annual_climatology" if annual_ranges else None),
             "panels":     [{"label": ascii_label(p["label"]), "images": p["n_images"]} for p in panels],
             "grid":       f"{layout['cols']} x {layout['rows']}" if panels else None,
         }

@@ -15,6 +15,7 @@ climatology panel has one per year.
 Public API:
   normalise_series(value)                    -> series kind or None
   infer_series_from_prompt(prompt)           -> series kind or None
+  refine_series(kind, prompt, start, end)    -> (kind, note): fixes a missed climatology
   build_panels(kind, date_start, date_end, custom, today) -> list of panels
   series_title(kind, reducer, title_label, plain)         -> figure title
   series_subtitle(kind, panels)                           -> line under the title
@@ -26,8 +27,12 @@ from __future__ import annotations
 import re
 from datetime import date, timedelta
 
-SERIES_KINDS = ("monthly", "seasonal", "annual", "monthly_climatology", "seasonal_climatology", "custom")
+SERIES_KINDS = ("monthly", "seasonal", "annual", "monthly_climatology", "seasonal_climatology",
+                "annual_climatology", "custom")
 CLIMATOLOGIES = ("monthly_climatology", "seasonal_climatology")
+# "annual_climatology" is not a figure of several maps but ONE map: the mean
+# annual value over several years (e.g. mean annual rainfall 2001-2020). The
+# pipeline handles it as a single map built from per-year composites.
 # More maps than this are too small to read on one page.
 MAX_PANELS = 36
 
@@ -38,6 +43,8 @@ _SERIES_ALIASES = {
     "monthly_climatology": "monthly_climatology", "month_climatology": "monthly_climatology",
     "climatology": "monthly_climatology", "monthly_normals": "monthly_climatology",
     "seasonal_climatology": "seasonal_climatology", "season_climatology": "seasonal_climatology",
+    "annual_climatology": "annual_climatology", "annual_mean": "annual_climatology",
+    "mean_annual": "annual_climatology", "long_term_annual": "annual_climatology",
     "panels": "custom", "comparison": "custom", "compare": "custom",
 }
 _MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
@@ -46,7 +53,7 @@ _MONTHS = ["January", "February", "March", "April", "May", "June", "July", "Augu
 # both hemispheres and in the tropics. December opens the first one.
 _SEASON_STARTS = (12, 3, 6, 9)
 _SEASON_NAMES = {12: "Dec-Feb", 3: "Mar-May", 6: "Jun-Aug", 9: "Sep-Nov"}
-_UNIT_WORD = {"monthly": "month", "seasonal": "season", "annual": "year",
+_UNIT_WORD = {"monthly": "month", "seasonal": "season", "annual": "year", "annual_climatology": "year",
               "monthly_climatology": "calendar month", "seasonal_climatology": "season"}
 _STAT_WORD = {"sum": "total", "mean": "mean", "median": "median", "max": "maximum", "min": "minimum"}
 
@@ -75,6 +82,66 @@ def infer_series_from_prompt(prompt: str) -> str | None:
     if re.search(r"\b(annual|yearly|year[- ]by[- ]year|(each|every|per|by) year)\b", text):
         return "annual"
     return None
+
+
+# Wording of climate and hydrology papers for an average over several years
+# (a climatology, or "normals"): "long-term monthly mean", "multi-year
+# average", "average of all Januaries", "mean annual cycle", ...
+_LONG_TERM = re.compile(
+    r"\b(long[- ]?term|climatolog\w*|climate normals?|normals|multi[- ]?(year|annual|decadal)\w*"
+    r"|inter[- ]?annual (mean|average)|(mean|average|typical) (seasonal|annual|monthly) cycle"
+    r"|averaged? (over|across) (all |the |several |many )*years"
+    r"|(average|mean) (of|for|across) (all|each|every) (the )?(januar|februar|calendar month|month|season)\w*"
+    r"|(average|mean|typical) (year|month)s?\b)")
+_AVERAGE = re.compile(r"\b(average|averaged|mean|avg)\b")
+_MONTHLY = re.compile(r"\b(monthly|month[- ]wise|(each|every|per|by) (calendar )?month|calendar months|12 months)\b")
+_SEASONAL = re.compile(r"\b(seasonal|season[- ]wise|(each|every|per|by) season|seasons)\b")
+_ANNUAL = re.compile(r"\b(annual|annually|yearly|year)\b")
+_YEAR_BY_YEAR = re.compile(r"\b((each|every|per|by) year|year[- ]by[- ]year|year[- ]wise|for each of the years)\b")
+# "Mean annual rainfall 2001-2020" (MAP) is the average year: one map. The
+# reverse order, "annual mean NO2 2019-2024", is left to the agent: it is
+# often meant year by year.
+_MEAN_ANNUAL = re.compile(r"\b(mean|average|avg)\s+(annual|yearly)\b")
+
+
+def refine_series(kind: str | None, prompt: str, date_start: str, date_end: str) -> tuple[str | None, str | None]:
+    """
+    Correct the series kind the agent chose when the wording of the request
+    plainly asks for a multi-year average (a climatology) - a common slip,
+    e.g. "monthly" (one map per month of every year) for "long-term monthly
+    average ET 2020-2025" (the 12 calendar months, each averaged over the
+    years). Returns (kind, note); note says what was changed, or is None.
+    """
+    try:
+        years = date.fromisoformat(date_end).year - date.fromisoformat(date_start).year + 1
+    except Exception:
+        return kind, None
+    if years < 2:
+        return kind, None
+    text = prompt.lower()
+    long_term = bool(_LONG_TERM.search(text))
+    averaged = long_term or bool(_AVERAGE.search(text))
+
+    def too_many(k):
+        return len(build_panels(k, date_start, date_end)) > MAX_PANELS
+
+    new = kind
+    if kind in ("monthly", None) and _MONTHLY.search(text) and (
+            long_term or (kind == "monthly" and averaged and too_many("monthly"))):
+        new = "monthly_climatology"
+    elif kind in ("seasonal", None) and _SEASONAL.search(text) and (
+            long_term or (kind == "seasonal" and averaged and too_many("seasonal"))):
+        new = "seasonal_climatology"
+    elif (kind in ("annual", None) and _ANNUAL.search(text) and not _YEAR_BY_YEAR.search(text)
+          and not _MONTHLY.search(text) and not _SEASONAL.search(text)
+          and (long_term or _MEAN_ANNUAL.search(text))):
+        new = "annual_climatology"
+    if new == kind:
+        return kind, None
+    what = {"monthly_climatology": "the 12 calendar months, each averaged over the years",
+            "seasonal_climatology": "the 4 seasons, each averaged over the years",
+            "annual_climatology": "one map of the average year"}[new]
+    return new, f"Read as a long-term (multi-year) average: {what}."
 
 
 def _add_months(day: date, months: int) -> date:
@@ -198,8 +265,8 @@ def series_title(kind: str, reducer: str, title_label: str, plain: bool = False)
     unit = {"monthly": "Monthly", "seasonal": "Seasonal", "annual": "Annual"}.get(kind)
     if unit:
         return " ".join(w for w in (unit, stat, subject) if w)
-    if kind in CLIMATOLOGIES:
-        unit = "monthly" if kind == "monthly_climatology" else "seasonal"
+    if kind in CLIMATOLOGIES or kind == "annual_climatology":
+        unit = {"monthly_climatology": "monthly", "seasonal_climatology": "seasonal"}.get(kind, "annual")
         if plain:
             return f"Long-term {unit} {subject}"
         if reducer == "sum":
@@ -243,7 +310,10 @@ def series_processing(kind: str, reducer: str, n_images: int, plain: bool = Fals
     """How the maps were made, for the credit block."""
     unit = _UNIT_WORD.get(kind, "period")
     what = "Most common class" if reducer == "mode" else f"{reducer.capitalize()} of the images"
-    if kind in CLIMATOLOGIES and reducer == "sum" and not plain:
+    if kind == "annual_climatology":
+        text = ("Sum of the images of each year, averaged over the years" if reducer == "sum" and not plain
+                else f"{what} across all years")
+    elif kind in CLIMATOLOGIES and reducer == "sum" and not plain:
         text = f"Sum of the images of each {unit} in every year, averaged over the years"
     elif kind in CLIMATOLOGIES:
         text = f"{what} of each {unit} across all years"

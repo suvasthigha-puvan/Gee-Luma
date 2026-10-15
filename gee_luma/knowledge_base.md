@@ -336,6 +336,54 @@ and `temporal_reducer` applies inside each map's own period:
 | seasonal NDVI                                     | seasonal             | median           |
 | average monthly rainfall over many years          | monthly_climatology  | sum              |
 | long-term monthly mean temperature                | monthly_climatology  | mean             |
+| long-term monthly average ET 2020 to 2025         | monthly_climatology  | sum              |
+| seasonal climatology of NDVI 2015-2024            | seasonal_climatology | median           |
+| mean annual rainfall 2001-2020                    | annual_climatology   | sum              |
+| long-term average LST 2015-2024 (one map)         | annual_climatology   | mean             |
 | land cover in 2005, 2012 and 2020                 | custom               | mode             |
 
 A single period ("total rainfall in 2023", "NDVI for March 2024") is one map: `series` = "none".
+
+### Rule 10 — Research terms for time
+Researchers in climatology, hydrology and remote sensing use these words with fixed meanings.
+Read the request with them, not word by word.
+
+**Multi-year averages (climatologies).** A *climatology* (or *climate normal*, *long-term mean*,
+*LTM*, *multi-year mean*) averages the SAME calendar period across several years. The WMO
+standard normal is a 30-year average (currently 1991–2020), but users apply the word to any span.
+- "long-term monthly average / mean", "mean monthly", "average monthly ... from 2020 to 2025",
+  "monthly climatology", "monthly normals", "average of all Januaries", "mean annual cycle",
+  "seasonal cycle", "intra-annual variation (averaged over years)"
+  → `monthly_climatology`: 12 maps, January = mean of every January in the period, and so on.
+- "long-term seasonal average", "seasonal climatology", "mean seasonal" over several years
+  → `seasonal_climatology`: 4 maps (Dec–Feb, Mar–May, Jun–Aug, Sep–Nov).
+- "mean annual X", "average annual X", "annual average/mean over 2001–2020", "long-term annual",
+  "MAP" (mean annual precipitation), "MAAT" (mean annual air temperature), "long-term average"
+  → `annual_climatology`: ONE map of the average year.
+- With several years, "average/mean monthly" (or seasonal) almost always means the climatology.
+  The plain `monthly` / `seasonal` / `annual` series are only for an explicit year-by-year breakdown:
+  "each month of 2023 and 2024", "monthly time series", "month by month", "year by year", "for each year".
+
+**What the value of each map is (temporal_reducer).**
+- *total*, *cumulative*, *accumulated*, *sum*, *amount* of rainfall / ET / runoff → `sum`.
+  A "monthly average rainfall" climatology is still `sum`: each month's total is averaged over the years
+  (units mm/month). "Average daily rainfall" → `mean` (units mm/day).
+- *mean*, *average* of a state variable (temperature, LST, NDVI, soil moisture, NO2, night lights) → `mean`.
+- *median composite*, cloud-free composite of reflectance / indices → `median`.
+- *maximum value composite (MVC)*, *peak*, *maximum* (NDVI, fire, temperature) → `max`; *minimum* → `min`.
+- *dominant*, *most frequent*, *majority* class → `mode`.
+
+**Periods.**
+- *Water year* / *hydrological year*: a 12-month year that does not start in January; use `custom`
+  panels with the stated start month (e.g. Oct–Sep).
+- *Wet season* / *dry season*, *monsoon*, crop seasons: use the dates the user states; otherwise use
+  well-known regional definitions in `custom` panels. Sri Lanka: Maha season ≈ Oct–Mar (northeast
+  monsoon, main rice season), Yala ≈ Apr–Sep (southwest monsoon); monsoon periods: first
+  inter-monsoon Mar–Apr, southwest monsoon May–Sep, second inter-monsoon Oct–Nov, northeast monsoon Dec–Feb.
+- *Growing season*: the region's crop season if known (Northern Hemisphere default Apr–Sep).
+- *Dekad* = 10-day period, *pentad* = 5-day period: too many maps for a long span; use one map or monthly.
+
+**Not available yet.** Anomalies (*departure from normal*, *standardized anomaly / z-score*, *% of normal*),
+trends (*Sen's slope*, *Mann-Kendall*, *linear trend*) and variability (*standard deviation*, *coefficient
+of variation*) are not computed. For such requests make the closest supported map (usually the period
+the user asked about, or a `custom` comparison with the reference period) and say so in "notes".
