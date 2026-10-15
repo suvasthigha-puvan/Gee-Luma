@@ -463,7 +463,7 @@ def api_file(request: Request):
         geotiff = res["geotiff"]
         if "bytes" not in geotiff:
             try:
-                geotiff["bytes"] = fetch_geotiff(geotiff["url"])
+                geotiff["bytes"] = fetch_geotiff(geotiff)
             except Exception as e:
                 return JSONResponse({"error": f"GeoTIFF export failed ({e})."}, status_code=502)
         return send(geotiff["bytes"], "image/tiff", f"{base}.tif")

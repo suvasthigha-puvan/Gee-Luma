@@ -344,7 +344,7 @@ if "last_result" in st.session_state:
             if st.button("Prepare GeoTIFF", **_stretch(st.button)):
                 try:
                     with st.spinner("Downloading GeoTIFF from Earth Engine..."):
-                        geotiff["bytes"] = fetch_geotiff(geotiff["url"])
+                        geotiff["bytes"] = fetch_geotiff(geotiff)
                     st.rerun()
                 except Exception as e:
                     st.error(f"GeoTIFF export failed: {e}")
