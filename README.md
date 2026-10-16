@@ -31,12 +31,14 @@ Gee-Luma/
 ├── server.py                # Start here: web API + host of the React interface
 ├── app.py                   # Streamlit interface (alternative to the web one)
 ├── requirements.txt
-├── .env.example             # Copy to .env and add your OpenAI key
+├── .env.example             # What the .env file holds (the setup window writes it)
 ├── frontend/                # React interface (Vite + TypeScript)
 ├── assets/                  # Logo
 ├── docs/                    # Screenshots
 └── gee_luma/                # The map pipeline (Python package)
     ├── pipeline.py          # The whole pipeline, independent of any interface
+    ├── settings.py          # Reads and writes the .env file
+    ├── connections.py       # Earth Engine sign-in and project checks, AI key check
     ├── catalog_search.py    # Live Earth Engine catalog search (agent tool)
     ├── dataset_options.py   # Datasets to choose from when several fit the request
     ├── stac_metadata.py     # Per-dataset metadata from the EE STAC catalog (agent tool)
@@ -59,45 +61,122 @@ Gee-Luma/
     └── utils.py             # Shared helpers
 ```
 
-## Quick start
+## Getting started
+
+Setting up takes about 10 minutes, once. After that, starting Gee-Luma is one command.
+
+### What you need
+
+| | Where to get it |
+|---|---|
+| **Python 3.10 or newer** | [python.org/downloads](https://www.python.org/downloads/). On Windows, tick **"Add python.exe to PATH"** in the installer. |
+| **A Google account with an Earth Engine project** | [Register a project for Earth Engine](https://code.earthengine.google.com/register). Free for non-commercial use (research, education, non-profits). Note the **project ID**, for example `my-earthengine-project`. |
+| **An AI API key** | [OpenAI](https://platform.openai.com/api-keys) (recommended) or [Google AI Studio](https://aistudio.google.com/apikey) for Gemini. A map costs well under one US cent with GPT-4o mini. |
+
+### Step 1: Download Gee-Luma
+
+Either click **Code → Download ZIP** on GitHub and unzip it, or use git:
 
 ```bash
 git clone https://github.com/suvasthigha-puvan/Gee-Luma.git
-cd Gee-Luma
-
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-earthengine authenticate
-cp .env.example .env       # then fill in every setting
-
-# Build the web interface once (needs Node.js 18+)
-cd frontend
-npm install
-npm run build
-cd ..
-
-# Start Gee-Luma
-python server.py            # http://localhost:<PORT from .env>
 ```
 
-The Streamlit interface still works: `streamlit run app.py`.
+### Step 2: Install (once)
 
-All settings, including your Earth Engine project ID, are read from the `.env` file only;
-nothing is built into the code. See [Environment variables](#environment-variables).
+Open a terminal **in the Gee-Luma folder** (Windows: open the folder, type `cmd` in the
+address bar and press Enter), then run:
+
+**Windows**
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+**macOS / Linux**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+The install takes a few minutes.
+
+### Step 3: Start Gee-Luma
+
+```bash
+python server.py
+```
+
+Gee-Luma opens in your browser at http://localhost:8000. Keep the terminal open while you
+use it; press `Ctrl+C` there to stop it.
+
+### Step 4: The setup window (first time only)
+
+The first time, a setup window opens by itself with three steps:
+
+1. **Sign in to Google Earth Engine.** Click **Sign in with Google**, choose the Google
+   account that has your Earth Engine project, and allow access. When the page says the
+   sign-in worked, close it and go back to Gee-Luma.
+2. **Earth Engine project ID.** Type your project's ID (not its name).
+3. **AI model and API key.** Pick a model and paste your API key.
+
+Click **Check and save**. Gee-Luma tries each one and tells you in plain words if something
+needs fixing. Your details are saved on your computer only, in a file called `.env` in the
+Gee-Luma folder, and are used every time you start Gee-Luma.
+
+Now describe a map, for example *"NDVI map for Sri Lanka using Sentinel-2, last 3 months"*.
+
+### Every time after that
+
+Open a terminal in the Gee-Luma folder and run:
+
+| Windows | macOS / Linux |
+|---|---|
+| `.venv\Scripts\activate` then `python server.py` | `source .venv/bin/activate` then `python server.py` |
+
+### When a project reaches its Earth Engine limit
+
+Earth Engine limits how much each project can use. When a map fails because your project
+reached its limit, Gee-Luma asks: **"Would you like to switch to a different Earth Engine
+project?"**
+
+- **Yes, switch project** opens a window for another project ID. If that project belongs to a
+  different Google account, click **Use another Google account** first. Then click
+  **Check and switch** and try the map again.
+- **No** keeps your project. Limits reset over time, so you can try again later.
+
+To change the project, model or API key at any other time, click the **gear icon** at the top
+right.
+
+### If something goes wrong
+
+| Problem | What to do |
+|---|---|
+| `python` is not found | Reinstall Python with "Add python.exe to PATH" ticked, then open a new terminal. On macOS/Linux use `python3`. |
+| "Your Google account cannot use the project" | Check the project ID, and that you signed in with the account that owns it. |
+| "The project is not registered to use Earth Engine" | [Register it](https://code.earthengine.google.com/register), then click **Check and save** again. |
+| "The AI service did not accept this key" | Copy the key again in full. An OpenAI key needs credit on the account. |
+| Port 8000 is already in use | Change `PORT` in the `.env` file to another number, such as `8010`. |
+| The browser did not open | Go to http://localhost:8000 yourself. |
+
+The Streamlit interface still works too, once the setup is done: `streamlit run app.py`.
 
 ### Working on the interface
 
-Run the API and the interface's dev server side by side; the dev server reloads on
-every change and forwards `/api` calls to the Python server:
+The built interface (`frontend/dist`) is included, so running Gee-Luma does not need Node.js.
+To change the interface, install [Node.js 18+](https://nodejs.org) and run the API and the
+interface's dev server side by side. The dev server reloads on every change and forwards
+`/api` calls to the Python server:
 
 ```bash
-python server.py            # terminal 1
-cd frontend && npm run dev  # terminal 2 -> http://localhost:5173
+python server.py --no-browser   # terminal 1
+cd frontend && npm install && npm run dev   # terminal 2 -> http://localhost:5173
 ```
 
-Run `npm run build` again to update what `server.py` serves.
+Run `npm run build` in `frontend` to update what `server.py` serves.
 
 ## The web interface
 
@@ -207,18 +286,22 @@ A request for a single period still produces the single-map layout described nex
   Earth Engine caps direct downloads at about 48 MB, so large regions are exported
   at a coarser pixel size than the dataset's native one; the app states the size used.
 
-## Environment variables
+## Settings (the .env file)
 
-All four are required and are read from the `.env` file only (the nearest one, here or in
-a folder above; its values win over environment variables of the same name). There are no
-defaults in the code: a missing setting is reported when the app starts.
+The setup window writes these to the `.env` file in the Gee-Luma folder, so you never have to
+edit it by hand. The app reads its settings from this file only (if there is none there, the
+nearest `.env` in a folder above is used).
 
-| Variable         | Description                                                  |
-|------------------|--------------------------------------------------------------|
-| `OPENAI_API_KEY` | Key for the CrewAI agent                                     |
-| `EE_PROJECT`     | Earth Engine project ID                                      |
-| `GEE_LUMA_MODEL` | Agent model, as `provider/model`                             |
-| `PORT`           | Port for `server.py`; the interface's dev server proxies to it |
+| Setting       | What it is                                                         |
+|---------------|--------------------------------------------------------------------|
+| `EE_PROJECT`  | Earth Engine project ID                                            |
+| `LLM_MODEL`   | AI model, as `provider/model`, for example `openai/gpt-4o-mini`    |
+| `LLM_API_KEY` | Key for that AI service                                            |
+| `PORT`        | Port for `server.py`; `8000` is written on the first start         |
+
+Your Google sign-in for Earth Engine is kept where Earth Engine's own tools keep it
+(`~/.config/earthengine/credentials`), not in the `.env` file. Never share or commit
+the `.env` file: it holds your API key (`.gitignore` already leaves it out).
 
 ## License
 

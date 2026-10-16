@@ -36,7 +36,6 @@ import re
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from dotenv import load_dotenv
 import textwrap
 from crewai import Agent, Task, Crew, LLM
 from gee_luma.catalog_search import search_gee_catalog_tool, recommended_for
@@ -281,25 +280,9 @@ PALETTE_PRESETS = {
     "Spectral":    ['#9E0142','#D53E4F','#FDAE61','#FEE08B','#E6F598','#3288BD','#5E4FA2'],
 }
 
-# Settings come from the .env file only (found by walking up from here), and
-# win over environment variables of the same name. They are read at import.
-load_dotenv(override=True)
-REQUIRED_SETTINGS = ("OPENAI_API_KEY", "EE_PROJECT", "GEE_LUMA_MODEL", "PORT")
-EE_PROJECT = os.getenv("EE_PROJECT", "").strip()
-LLM_MODEL = os.getenv("GEE_LUMA_MODEL", "").strip()
-
-
-def missing_settings_message(names=REQUIRED_SETTINGS) -> str | None:
-    """None when every named setting is in the .env file; otherwise what to add."""
-    missing = [n for n in names if not os.getenv(n, "").strip()]
-    if not missing:
-        return None
-    return f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not set. Add to the .env file (see .env.example)."
-
-
-def create_llm(api_key: str) -> LLM:
-    """The language model the agent uses."""
-    return LLM(model=LLM_MODEL, api_key=api_key, temperature=0.2)
+def create_llm(api_key: str, model: str) -> LLM:
+    """The language model the agent uses (model as provider/model)."""
+    return LLM(model=model, api_key=api_key, temperature=0.2)
 
 
 def render_original_map(job: dict) -> dict:

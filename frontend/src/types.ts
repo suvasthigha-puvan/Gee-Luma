@@ -207,6 +207,22 @@ export interface Job extends JobSummary {
   notes: Note[];
   result: MapResult | null;
   choice?: DatasetChoice | null;
+  /** A usage limit stopped the job: Earth Engine's (for this project) or the AI service's. */
+  limit?: { kind: "earthengine" | "llm"; project: string } | null;
+}
+
+/** The settings in the .env file, and whether they work. */
+export interface Setup {
+  configured: boolean;
+  signed_in: boolean;
+  project: string;
+  project_ok: boolean;
+  project_problem: string | null;
+  model: string;
+  has_key: boolean;
+  key_hint: string | null;
+  env_file: string;
+  register_url: string;
 }
 
 export interface RegionUpload {

@@ -2051,3 +2051,270 @@ kbd {
     padding: 0 10px;
   }
 }
+
+/* ============================================================
+   Setup window (Earth Engine sign-in, project, AI key)
+   ============================================================ */
+button.status-pill {
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+button.status-pill:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-3);
+}
+
+.link-button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+  overflow-y: auto;
+  background: rgba(8, 14, 20, 0.45);
+  backdrop-filter: blur(2px);
+}
+
+.dialog {
+  width: 100%;
+  max-width: 560px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+}
+
+.dialog-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 24px 6px;
+}
+
+.dialog-head h2 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 26px;
+  margin: 0;
+}
+
+.dialog-lead {
+  margin: 8px 0 0;
+  color: var(--text-2);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.dialog-lead code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.setup-steps {
+  list-style: none;
+  margin: 0;
+  padding: 10px 24px 4px;
+  display: flex;
+  flex-direction: column;
+}
+
+.setup-step {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 14px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.setup-step:last-child {
+  border-bottom: 0;
+}
+
+.setup-mark {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.setup-mark.is-done {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.setup-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.setup-title {
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 28px;
+}
+
+.setup-body .field-hint {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.setup-body .field-hint a {
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.setup-body .field-error {
+  margin: 0;
+}
+
+.setup-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.setup-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.setup-key {
+  position: relative;
+}
+
+.setup-key svg {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-3);
+  pointer-events: none;
+}
+
+.setup-key .input {
+  padding-left: 36px;
+}
+
+.dialog > .field-error.with-icon {
+  margin: 0 24px 8px;
+}
+
+.dialog-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 24px 20px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+
+.dialog-foot .field-hint {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.dialog-save {
+  flex: none;
+  padding: 0 20px;
+  height: 42px;
+}
+
+/* ---------- Usage limit reached ---------- */
+.limit-question {
+  display: flex;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--warn-border);
+  border-radius: var(--radius-sm);
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.limit-question > svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.limit-question p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.limit-question.is-done {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.limit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.limit-actions .secondary,
+.failure-card .limit-actions .secondary {
+  margin-top: 0;
+}
+
+.limit-yes {
+  height: 38px;
+  padding: 0 16px;
+  font-size: 13.5px;
+}
+
+.failure-retry {
+  margin-top: 20px;
+  height: 40px;
+  padding: 0 18px;
+}
+
+@media (max-width: 560px) {
+  .dialog-head,
+  .setup-steps {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .dialog-foot {
+    flex-direction: column-reverse;
+    align-items: stretch;
+    padding: 14px 16px 16px;
+  }
+}

@@ -1,13 +1,16 @@
-import type { Job, JobSummary, MapRequest, Meta } from "./types";
+import type { Job, JobSummary, MapRequest, Meta, Setup } from "./types";
 
 /** Error carrying the message the server wrote for the user. */
 export class ApiError extends Error {
   /** HTTP status of the answer; 0 when the server could not be reached. */
   status: number;
+  /** Messages per field, when the server checked a form. */
+  details?: Record<string, string>;
 
-  constructor(message: string, status = 0) {
+  constructor(message: string, status = 0, details?: Record<string, string>) {
     super(message);
     this.status = status;
+    this.details = details;
   }
 }
 
@@ -19,7 +22,11 @@ async function readJson<T>(response: Response): Promise<T> {
     /* not JSON */
   }
   if (!response.ok) {
-    throw new ApiError(body?.error ?? `The server answered with an error (${response.status}).`, response.status);
+    throw new ApiError(
+      body?.error ?? `The server answered with an error (${response.status}).`,
+      response.status,
+      body?.errors,
+    );
   }
   return body as T;
 }
@@ -42,6 +49,16 @@ const postJson = (body: unknown): RequestInit => ({
 
 export const api = {
   meta: () => call<Meta>("/api/meta"),
+
+  setup: () => call<Setup>("/api/setup"),
+
+  saveSetup: (values: { project: string; model: string; api_key: string }) =>
+    call<{ ok: true; setup: Setup }>("/api/setup", postJson(values)),
+
+  startSignin: () => call<{ url: string }>("/api/setup/signin", { method: "POST" }),
+
+  signinStatus: () =>
+    call<{ state: "idle" | "waiting" | "done" | "error"; error: string | null; signed_in: boolean }>("/api/setup/signin"),
 
   checkRegion: (geojson: unknown) =>
     call<{ ok: true; label: string; features: number; bounds: any }>("/api/region", postJson(geojson)),

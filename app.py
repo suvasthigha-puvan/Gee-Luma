@@ -13,14 +13,13 @@ Run with:
 
 import inspect
 import json
-import os
 from pathlib import Path
 
 import ee
 import streamlit as st
+from gee_luma import settings
 from gee_luma.pipeline import (
-    run_pipeline, render_original_map, create_llm, missing_settings_message,
-    PALETTE_PRESETS, EE_PROJECT, SPYNDEX_AVAILABLE,
+    run_pipeline, render_original_map, create_llm, PALETTE_PRESETS, SPYNDEX_AVAILABLE,
 )
 from gee_luma.dataset_options import AUTO_CHOICE, option_summary
 from gee_luma.utils import ascii_label
@@ -64,10 +63,10 @@ st.set_page_config(
 inject_css()
 
 # ====================== SETTINGS ======================
-# Read from the .env file when gee_luma.pipeline was imported.
-_missing = missing_settings_message(("EE_PROJECT", "GEE_LUMA_MODEL"))
-if _missing:
-    st.error(_missing)
+# Kept in the .env file, which the web app's setup window writes (python server.py).
+EE_PROJECT, LLM_MODEL = settings.get("EE_PROJECT"), settings.get("LLM_MODEL")
+if not EE_PROJECT or not LLM_MODEL:
+    st.error("Gee-Luma is not set up yet. Run `python server.py` once and fill in the setup window.")
     st.stop()
 
 # ====================== GEE AUTH ======================
@@ -81,11 +80,11 @@ if "ee_initialized" not in st.session_state:
 
 # ====================== OPENAI SETUP ======================
 if "crew_ready" not in st.session_state:
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = settings.get("LLM_API_KEY")
     if not api_key:
-        api_key = st.text_input("Enter your OpenAI API Key", type="password")
+        api_key = st.text_input("Enter your AI API key", type="password")
     if api_key:
-        st.session_state.llm = create_llm(api_key)
+        st.session_state.llm = create_llm(api_key, LLM_MODEL)
         st.session_state.crew_ready = True
 
 # ====================== SIDEBAR ======================

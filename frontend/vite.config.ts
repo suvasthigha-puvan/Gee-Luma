@@ -22,7 +22,7 @@ export default defineConfig(({ command, mode }) => {
   const dir = envDir();
   const apiPort = dir ? loadEnv(mode, dir, "").PORT : undefined;
   if (command === "serve" && !apiPort) {
-    throw new Error("PORT is not set. Add it to the .env file (see .env.example).");
+    throw new Error("PORT is not set yet. Run python server.py once: it writes PORT to the .env file.");
   }
   return {
     plugins: [react()],

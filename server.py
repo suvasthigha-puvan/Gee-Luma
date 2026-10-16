@@ -3,10 +3,11 @@ server.py
 ---------
 Web API for Gee-Luma and host of the React interface.
 
-    python server.py            -> http://localhost:<PORT>
+    python server.py            -> opens http://localhost:<PORT> in the browser
+    python server.py --no-browser
 
-Settings (OPENAI_API_KEY, EE_PROJECT, GEE_LUMA_MODEL, PORT) come from the
-.env file only; see .env.example.
+Settings (EE_PROJECT, LLM_MODEL, LLM_API_KEY, PORT) are kept in the .env
+file only. The app's setup window writes them; see gee_luma/settings.py.
 
 A map takes one to several minutes, so requests are jobs: the browser posts
 a request, gets a job id back at once, and polls the job for progress and
@@ -15,6 +16,10 @@ rendering and matplotlib are not safe to run concurrently in one process).
 
 Endpoints
     GET  /api/meta                       what the server can do, example requests
+    GET  /api/setup                      sign-in, project and AI settings, and whether they work
+    POST /api/setup                      check and save the settings
+    POST /api/setup/signin               start the Google sign-in for Earth Engine
+    GET  /api/setup/signin               how the sign-in is going
     POST /api/region                     validate an uploaded GeoJSON region
     POST /api/maps                       start a map job
     GET  /api/maps                       recent jobs
@@ -32,16 +37,16 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
+import sys
 import threading
 import time
 import uuid
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
-import ee
 import uvicorn
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -50,9 +55,9 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from gee_luma import connections, settings
 from gee_luma.pipeline import (
-    run_pipeline, render_original_map, create_llm, missing_settings_message,
-    PALETTE_PRESETS, EE_PROJECT, LLM_MODEL, SPYNDEX_AVAILABLE,
+    run_pipeline, render_original_map, create_llm, PALETTE_PRESETS, SPYNDEX_AVAILABLE,
 )
 from gee_luma.color_ramps import QGIS_RAMPS
 from gee_luma.dataset_options import AUTO_CHOICE
@@ -188,32 +193,34 @@ class Job:
         self.ui = RecordingUI()
         self.result: dict | None = None
         self.error: str | None = None
+        self.project = settings.get("EE_PROJECT")    # the Earth Engine project it runs on
 
 
 JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
 WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gee-luma")
-STATE = {"llm": None, "problems": []}
+STATE = {"llm": None, "ee_ok": False, "ee_problem": None}
+SIGN_IN = connections.SignIn()
 
 
 def _startup():
-    # Settings were loaded from the .env file when gee_luma.pipeline was imported.
-    problems = []
-    missing = missing_settings_message()
-    if missing:
-        problems.append(missing)
-    if EE_PROJECT:
-        try:
-            ee.Initialize(project=EE_PROJECT)
-        except Exception as e:
-            problems.append(f"Google Earth Engine could not be initialised ({e}). "
-                            "Run `earthengine authenticate` and check EE_PROJECT in the .env file.")
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if api_key and LLM_MODEL:
-        STATE["llm"] = create_llm(api_key)
-    STATE["problems"] = problems
-    for p in problems:
-        print("STARTUP PROBLEM:", p)
+    project = settings.get("EE_PROJECT")
+    if project and connections.signed_in():
+        STATE["ee_problem"] = connections.connect_earth_engine(project)
+        STATE["ee_ok"] = STATE["ee_problem"] is None
+    key, model = settings.get("LLM_API_KEY"), settings.get("LLM_MODEL")
+    STATE["llm"] = create_llm(key, model) if key and model else None
+    if not _ready():
+        print("Setup needed: open the app in the browser and fill in the setup window.")
+
+
+def _ready() -> bool:
+    return STATE["ee_ok"] and STATE["llm"] is not None
+
+
+def _busy() -> bool:
+    with JOBS_LOCK:
+        return any(j.status in ("queued", "running") for j in JOBS.values())
 
 
 def _run_job(job: Job):
@@ -332,9 +339,13 @@ def _job_payload(job: Job, full: bool = True) -> dict:
     with job.ui.lock:
         steps = [dict(s) for s in job.ui.steps]
         notes = [dict(n) for n in job.ui.notes]
+    errors = [n["text"] for n in notes if n["level"] == "error"] + [job.error or ""]
+    limit = connections.limit_kind(errors) if job.status == "error" else None
     payload = {
         "id": job.id,
         "status": job.status,
+        # A usage limit stopped the job: the app offers to switch project (or AI key).
+        "limit": {"kind": limit, "project": job.project} if limit else None,
         "prompt": job.request["prompt"],
         "created": job.created,
         "elapsed": round((job.finished or (job.status == "choice" and job.paused_at) or time.time())
@@ -358,14 +369,100 @@ def api_meta(request: Request):
         import spyndex
         index_count = len(spyndex.indices)
     return JSONResponse({
-        "ready": not STATE["problems"],
-        "problems": STATE["problems"],
+        "ready": _ready(),
+        "problems": [] if _ready() else ["Finish the setup to start making maps."],
         "palettes": [{"name": name, "colors": colors} for name, colors in PALETTE_PRESETS.items()],
         "ramps": [{"id": ramp_id, **ramp} for ramp_id, ramp in RAMPS.items()],
         "examples": EXAMPLE_REQUESTS,
         "index_count": index_count,
-        "model": LLM_MODEL.split("/")[-1],
+        "model": settings.get("LLM_MODEL").split("/")[-1],
     })
+
+
+def _setup_status() -> dict:
+    key = settings.get("LLM_API_KEY")
+    return {
+        "configured": _ready(),
+        "signed_in": connections.signed_in(),
+        "project": settings.get("EE_PROJECT"),
+        "project_ok": STATE["ee_ok"],
+        "project_problem": STATE["ee_problem"],
+        "model": settings.get("LLM_MODEL"),
+        "has_key": bool(key),
+        "key_hint": settings.key_hint(key) if key else None,
+        "env_file": str(settings.ENV_PATH),
+        "register_url": connections.REGISTER_URL,
+    }
+
+
+def api_setup(request: Request):
+    return JSONResponse(_setup_status())
+
+
+def _save_setup(body: dict) -> tuple[dict, int]:
+    project = str(body.get("project") or "").strip()
+    model = str(body.get("model") or "").strip()
+    saved_key = settings.get("LLM_API_KEY")
+    key = str(body.get("api_key") or "").strip() or saved_key
+
+    errors = {}
+    if not connections.signed_in():
+        errors["signin"] = "Sign in with Google first."
+    if not project:
+        errors["project"] = "Enter your Earth Engine project ID."
+    elif not re.fullmatch(r"[a-z][a-z0-9-]{4,62}", project):
+        errors["project"] = ("A project ID has 6 to 63 lowercase letters, digits and hyphens, "
+                             "like \"my-project-123\". Copy it from the Google Cloud console.")
+    if not model:
+        errors["llm"] = "Choose an AI model."
+    elif "/" not in model:
+        errors["llm"] = "Write the model as provider/model, for example openai/gpt-4o-mini."
+    elif not key:
+        errors["llm"] = "Paste the API key for this AI service."
+
+    if "signin" not in errors and "project" not in errors:
+        problem = connections.connect_earth_engine(project)
+        if problem:
+            errors["project"] = problem
+            previous = settings.get("EE_PROJECT")
+            if STATE["ee_ok"] and previous and previous != project:
+                connections.connect_earth_engine(previous)   # keep working on the old one
+    llm_changed = key != saved_key or model != settings.get("LLM_MODEL") or STATE["llm"] is None
+    if "llm" not in errors and llm_changed:
+        problem = connections.check_llm(key, model)
+        if problem:
+            errors["llm"] = problem
+    if errors:
+        return {"ok": False, "errors": errors}, 400
+
+    settings.save({"EE_PROJECT": project, "LLM_MODEL": model, "LLM_API_KEY": key})
+    STATE.update(ee_ok=True, ee_problem=None, llm=create_llm(key, model))
+    return {"ok": True, "setup": _setup_status()}, 200
+
+
+async def api_save_setup(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "The request body must be JSON."}, status_code=400)
+    if _busy():
+        return JSONResponse({"error": "A map is being made. Change the settings when it has finished."},
+                            status_code=409)
+    payload, status = await run_in_threadpool(_save_setup, body)
+    return JSONResponse(payload, status_code=status)
+
+
+async def api_start_signin(request: Request):
+    try:
+        url = await run_in_threadpool(SIGN_IN.start)
+    except Exception as e:
+        return JSONResponse({"error": f"The Google sign-in could not be started ({e})."}, status_code=500)
+    return JSONResponse({"url": url})
+
+
+def api_signin_status(request: Request):
+    return JSONResponse({"state": SIGN_IN.state, "error": SIGN_IN.error,
+                         "signed_in": SIGN_IN.state == "done" or connections.signed_in()})
 
 
 async def api_region(request: Request):
@@ -383,8 +480,8 @@ async def api_region(request: Request):
 
 
 async def api_create_map(request: Request):
-    if STATE["problems"]:
-        return JSONResponse({"error": " ".join(STATE["problems"])}, status_code=503)
+    if not _ready():
+        return JSONResponse({"error": "Finish the setup first (Settings, top right)."}, status_code=503)
     try:
         body = await request.json()
     except Exception:
@@ -555,6 +652,10 @@ def api_file(request: Request):
 
 routes = [
     Route("/api/meta", api_meta),
+    Route("/api/setup", api_setup),
+    Route("/api/setup", api_save_setup, methods=["POST"]),
+    Route("/api/setup/signin", api_start_signin, methods=["POST"]),
+    Route("/api/setup/signin", api_signin_status),
     Route("/api/region", api_region, methods=["POST"]),
     Route("/api/maps", api_create_map, methods=["POST"]),
     Route("/api/maps", api_list_maps, methods=["GET"]),
@@ -578,11 +679,12 @@ app = Starlette(routes=routes, lifespan=lifespan)
 
 
 if __name__ == "__main__":
-    port = os.getenv("PORT", "").strip()
-    if not port.isdigit():
-        raise SystemExit("PORT is not set (or not a number). Add it to the .env file (see .env.example).")
-    port = int(port)
+    port = settings.port()
     if not FRONTEND_DIR.exists():
-        print("Note: frontend/dist not found - build the interface with `npm run build` in frontend/.")
-    print(f"Gee-Luma: http://localhost:{port}")
+        raise SystemExit("The interface is missing (frontend/dist). Build it with `npm install` and "
+                         "`npm run build` in the frontend folder.")
+    url = f"http://localhost:{port}"
+    print(f"Gee-Luma is running at {url}  (press Ctrl+C to stop)")
+    if "--no-browser" not in sys.argv:
+        threading.Timer(1.5, webbrowser.open, args=(url,)).start()
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
