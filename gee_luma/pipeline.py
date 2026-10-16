@@ -41,6 +41,7 @@ import textwrap
 from crewai import Agent, Task, Crew, LLM
 from gee_luma.catalog_search import search_gee_catalog_tool, recommended_for
 from gee_luma.dataset_options import find_dataset_options, AUTO_CHOICE
+from gee_luma.request_check import check_request
 
 try:
     from pyproj import Transformer, CRS
@@ -305,6 +306,13 @@ def run_pipeline(user_prompt: str, *, llm, ui, uploaded_region_geojson=None, upl
     """
     dataset = (dataset or "").strip()
     if not dataset:
+        # Text that describes no map ("asdf") stops here, before the dataset
+        # search offers datasets for it.
+        with ui.spinner("Reading your request..."):
+            problem = check_request(user_prompt, llm, has_uploaded_region=uploaded_region_geojson is not None)
+        if problem:
+            ui.error(problem)
+            ui.stop()
         with ui.spinner("Checking which datasets fit your request..."):
             dataset_options = find_dataset_options(user_prompt, llm)
         if dataset_options:
