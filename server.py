@@ -3,7 +3,10 @@ server.py
 ---------
 Web API for Gee-Luma and host of the React interface.
 
-    python server.py            -> http://localhost:8000
+    python server.py            -> http://localhost:<PORT>
+
+Settings (OPENAI_API_KEY, EE_PROJECT, GEE_LUMA_MODEL, PORT) come from the
+.env file only; see .env.example.
 
 A map takes one to several minutes, so requests are jobs: the browser posts
 a request, gets a job id back at once, and polls the job for progress and
@@ -38,7 +41,6 @@ from pathlib import Path
 
 import ee
 import uvicorn
-from dotenv import load_dotenv
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -46,7 +48,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from gee_luma.pipeline import (
-    run_pipeline, render_original_map, create_llm,
+    run_pipeline, render_original_map, create_llm, missing_settings_message,
     PALETTE_PRESETS, EE_PROJECT, LLM_MODEL, SPYNDEX_AVAILABLE,
 )
 from gee_luma.dataset_options import AUTO_CHOICE
@@ -183,18 +185,20 @@ STATE = {"llm": None, "problems": []}
 
 
 def _startup():
-    load_dotenv()
+    # Settings were loaded from the .env file when gee_luma.pipeline was imported.
     problems = []
-    try:
-        ee.Initialize(project=EE_PROJECT)
-    except Exception as e:
-        problems.append(f"Google Earth Engine could not be initialised ({e}). "
-                        "Run `earthengine authenticate` and check the project ID.")
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
+    missing = missing_settings_message()
+    if missing:
+        problems.append(missing)
+    if EE_PROJECT:
+        try:
+            ee.Initialize(project=EE_PROJECT)
+        except Exception as e:
+            problems.append(f"Google Earth Engine could not be initialised ({e}). "
+                            "Run `earthengine authenticate` and check EE_PROJECT in the .env file.")
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if api_key and LLM_MODEL:
         STATE["llm"] = create_llm(api_key)
-    else:
-        problems.append("OPENAI_API_KEY is not set. Add it to a .env file next to server.py.")
     STATE["problems"] = problems
     for p in problems:
         print("STARTUP PROBLEM:", p)
@@ -494,7 +498,10 @@ app = Starlette(routes=routes, lifespan=lifespan)
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    port = os.getenv("PORT", "").strip()
+    if not port.isdigit():
+        raise SystemExit("PORT is not set (or not a number). Add it to the .env file (see .env.example).")
+    port = int(port)
     if not FRONTEND_DIR.exists():
         print("Note: frontend/dist not found - build the interface with `npm run build` in frontend/.")
     print(f"Gee-Luma: http://localhost:{port}")

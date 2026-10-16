@@ -18,10 +18,8 @@ from pathlib import Path
 
 import ee
 import streamlit as st
-from dotenv import load_dotenv
-
 from gee_luma.pipeline import (
-    run_pipeline, render_original_map, create_llm,
+    run_pipeline, render_original_map, create_llm, missing_settings_message,
     PALETTE_PRESETS, EE_PROJECT, SPYNDEX_AVAILABLE,
 )
 from gee_luma.dataset_options import AUTO_CHOICE, option_summary
@@ -65,6 +63,13 @@ st.set_page_config(
 
 inject_css()
 
+# ====================== SETTINGS ======================
+# Read from the .env file when gee_luma.pipeline was imported.
+_missing = missing_settings_message(("EE_PROJECT", "GEE_LUMA_MODEL"))
+if _missing:
+    st.error(_missing)
+    st.stop()
+
 # ====================== GEE AUTH ======================
 if "ee_initialized" not in st.session_state:
     try:
@@ -75,8 +80,6 @@ if "ee_initialized" not in st.session_state:
         st.stop()
 
 # ====================== OPENAI SETUP ======================
-load_dotenv()
-
 if "crew_ready" not in st.session_state:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:

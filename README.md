@@ -70,7 +70,7 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
 earthengine authenticate
-cp .env.example .env       # then put your OpenAI key in it
+cp .env.example .env       # then fill in every setting
 
 # Build the web interface once (needs Node.js 18+)
 cd frontend
@@ -79,12 +79,13 @@ npm run build
 cd ..
 
 # Start Gee-Luma
-python server.py            # http://localhost:8000
+python server.py            # http://localhost:<PORT from .env>
 ```
 
 The Streamlit interface still works: `streamlit run app.py`.
 
-Set `EE_PROJECT` to your own Earth Engine project ID (the default is in `gee_luma/pipeline.py`).
+All settings, including your Earth Engine project ID, are read from the `.env` file only;
+nothing is built into the code. See [Environment variables](#environment-variables).
 
 ### Working on the interface
 
@@ -208,12 +209,16 @@ A request for a single period still produces the single-map layout described nex
 
 ## Environment variables
 
-| Variable         | Description                                             |
-|------------------|---------------------------------------------------------|
-| `OPENAI_API_KEY` | Required for the CrewAI agent                           |
-| `EE_PROJECT`     | Earth Engine project ID (optional)                      |
-| `GEE_LUMA_MODEL` | Agent model, default `openai/gpt-4o-mini` (optional)    |
-| `PORT`           | Port for `server.py`, default 8000 (optional)           |
+All four are required and are read from the `.env` file only (the nearest one, here or in
+a folder above; its values win over environment variables of the same name). There are no
+defaults in the code: a missing setting is reported when the app starts.
+
+| Variable         | Description                                                  |
+|------------------|--------------------------------------------------------------|
+| `OPENAI_API_KEY` | Key for the CrewAI agent                                     |
+| `EE_PROJECT`     | Earth Engine project ID                                      |
+| `GEE_LUMA_MODEL` | Agent model, as `provider/model`                             |
+| `PORT`           | Port for `server.py`; the interface's dev server proxies to it |
 
 ## License
 

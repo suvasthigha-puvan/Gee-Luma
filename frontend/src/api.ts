@@ -1,7 +1,15 @@
 import type { Job, JobSummary, MapRequest, Meta } from "./types";
 
 /** Error carrying the message the server wrote for the user. */
-export class ApiError extends Error {}
+export class ApiError extends Error {
+  /** HTTP status of the answer; 0 when the server could not be reached. */
+  status: number;
+
+  constructor(message: string, status = 0) {
+    super(message);
+    this.status = status;
+  }
+}
 
 async function readJson<T>(response: Response): Promise<T> {
   let body: any = null;
@@ -11,7 +19,7 @@ async function readJson<T>(response: Response): Promise<T> {
     /* not JSON */
   }
   if (!response.ok) {
-    throw new ApiError(body?.error ?? `The server answered with an error (${response.status}).`);
+    throw new ApiError(body?.error ?? `The server answered with an error (${response.status}).`, response.status);
   }
   return body as T;
 }

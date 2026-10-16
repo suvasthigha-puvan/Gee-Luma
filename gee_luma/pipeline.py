@@ -256,6 +256,20 @@ GAP_FILL_OPT_OUT = ("no gap fill", "without gap fill", "no gap-fill", "don't fil
                     "no filling", "original only", "unfilled")
 
 
+def gap_fill_skipped_note(error: Exception) -> str:
+    """Why gap filling was skipped, in plain words (Earth Engine's own message goes to the log)."""
+    text = str(error).lower()
+    if "memory" in text:
+        reason = "the region is too large for Earth Engine to work out where the gaps are"
+    elif "timed out" in text or "timeout" in text or "deadline" in text:
+        reason = "Earth Engine took too long to work out where the gaps are"
+    elif "too many" in text or "quota" in text or "rate limit" in text:
+        reason = "Earth Engine is busy right now"
+    else:
+        reason = "Earth Engine could not work out where the gaps are"
+    return f"Gap filling was skipped: {reason}. The map shows the requested period only."
+
+
 
 PALETTE_PRESETS = {
     "Auto (index-based)": None,
@@ -266,8 +280,20 @@ PALETTE_PRESETS = {
     "Spectral":    ['#9E0142','#D53E4F','#FDAE61','#FEE08B','#E6F598','#3288BD','#5E4FA2'],
 }
 
-EE_PROJECT = os.getenv("EE_PROJECT", "ee-suvasthigha")
-LLM_MODEL = os.getenv("GEE_LUMA_MODEL", "openai/gpt-4o-mini")
+# Settings come from the .env file only (found by walking up from here), and
+# win over environment variables of the same name. They are read at import.
+load_dotenv(override=True)
+REQUIRED_SETTINGS = ("OPENAI_API_KEY", "EE_PROJECT", "GEE_LUMA_MODEL", "PORT")
+EE_PROJECT = os.getenv("EE_PROJECT", "").strip()
+LLM_MODEL = os.getenv("GEE_LUMA_MODEL", "").strip()
+
+
+def missing_settings_message(names=REQUIRED_SETTINGS) -> str | None:
+    """None when every named setting is in the .env file; otherwise what to add."""
+    missing = [n for n in names if not os.getenv(n, "").strip()]
+    if not missing:
+        return None
+    return f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not set. Add to the .env file (see .env.example)."
 
 
 def create_llm(api_key: str) -> LLM:
@@ -1043,7 +1069,8 @@ RGB Sentinel-2:
                             status_fill.update(
                                 label="No extra data found in nearby dates - map left as it is", state="complete")
                 except Exception as e:
-                    ui.caption(f"Gap filling was skipped ({e}).")
+                    print(f"Gap filling skipped: {e}")
+                    ui.caption(gap_fill_skipped_note(e))
 
         status_col.update(
             label=(f"Dataset loaded ({n_images} image{'s' if n_images != 1 else ''}"

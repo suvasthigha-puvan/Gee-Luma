@@ -17,7 +17,8 @@ to decide what should happen. Judge it by what the page shows and says.
    ```
    Then call `connectToBrowser` with `debuggerAddress: "127.0.0.1:1997"`. Work in that
    window and don't close it (`closeBrowser`) at the end.
-3. **The app on http://localhost:8000.** Check that `GET /api/meta` returns `"ready": true`.
+3. **The app on http://localhost:&lt;PORT&gt;** (`PORT` is set in the `.env` file). Check that
+   `GET /api/meta` returns `"ready": true`.
    If nothing is listening, start it in the background from the repo root:
    `../../.venv/Scripts/python.exe server.py`. Don't restart a server that's already running.
 4. Call `startConsoleCapture` and `startNetworkCapture` after the first `navigate`, so you

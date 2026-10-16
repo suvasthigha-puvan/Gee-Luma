@@ -53,8 +53,15 @@ export default function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [recent, setRecent] = useState<JobSummary[]>([]);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [missingMap, setMissingMap] = useState(false);    // a map link (?map=id) the server does not know
   const [submitting, setSubmitting] = useState(false);
   const pollTimer = useRef<number | null>(null);
+  const missingMapBanner = useRef<HTMLDivElement | null>(null);
+
+  // On a narrow screen the stage is below the composer: bring the notice into view.
+  useEffect(() => {
+    if (missingMap) missingMapBanner.current?.scrollIntoView({ block: "nearest" });
+  }, [missingMap]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -84,6 +91,7 @@ export default function App() {
   const follow = useCallback(
     (id: string) => {
       stopPolling();
+      setMissingMap(false);
       const tick = async () => {
         try {
           const next = await api.job(id);
@@ -94,7 +102,11 @@ export default function App() {
             refreshRecent();
           }
         } catch (e) {
-          setSubmitError(e instanceof ApiError ? e.message : "Lost contact with the server.");
+          if (e instanceof ApiError && e.status === 404) {
+            setMissingMap(true);        // shown on the stage, where the map was expected
+          } else {
+            setSubmitError(e instanceof ApiError ? e.message : "Lost contact with the server.");
+          }
           // A map from an earlier server run no longer exists: go back to the start.
           setJob((current) => (current && current.id === id && current.steps.length === 0 ? null : current));
           writeMapIdToUrl(null);
@@ -211,6 +223,16 @@ export default function App() {
               {problems.map((p) => (
                 <div key={p}>{p}</div>
               ))}
+            </div>
+          )}
+
+          {missingMap && (
+            <div className="banner banner-error" role="alert" ref={missingMapBanner}>
+              <strong>This map could not be opened.</strong>
+              <div>
+                The link may be wrong, or the map is no longer kept: the server holds only its most recent maps,
+                and none from before it restarted. Describe the map again to generate it.
+              </div>
             </div>
           )}
 
