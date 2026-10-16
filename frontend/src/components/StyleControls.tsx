@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Check, Palette, RotateCcw } from "lucide-react";
 import type { ColorRamp, MapStyle } from "../types";
+import { RampPicker, type RampGroup } from "./RampPicker";
 
 interface Props {
   style: MapStyle;
@@ -13,11 +14,6 @@ interface Props {
 /** A legend value as typed into a box: short, but exact enough to keep the map unchanged. */
 function asText(value: number): string {
   return String(Number(value.toPrecision(6)));
-}
-
-function gradient(colors: string[]): string {
-  const css = colors.map((c) => (/^[0-9a-f]{3}([0-9a-f]{3})?$/i.test(c) ? `#${c}` : c));
-  return `linear-gradient(90deg, ${css.join(", ")})`;
 }
 
 /** Colour ramp and legend range of a finished map, changed in place. */
@@ -59,8 +55,13 @@ export function StyleControls({ style, ramps, busy, onApply }: Props) {
     if (r) onApply(style.ramp, r[0], r[1]);
   };
 
-  const groups = Array.from(new Set(ramps.map((r) => r.group)));
-  const current = style.ramp === "original" ? style.original.palette : (ramps.find((r) => r.id === style.ramp)?.colors ?? style.palette);
+  const groups: RampGroup[] = [
+    { label: "This map", ramps: [{ id: "original", name: "Original colours", colors: style.original.palette }] },
+    ...Array.from(new Set(ramps.map((r) => r.group))).map((group) => ({
+      label: group === "QGIS" ? "QGIS colour ramps" : `${group} palettes`,
+      ramps: ramps.filter((r) => r.group === group),
+    })),
+  ];
   const rangeChanged = minText !== asText(style.min) || maxText !== asText(style.max);
   const isOriginal =
     style.ramp === "original" && style.min === style.original.min && style.max === style.original.max;
@@ -71,31 +72,7 @@ export function StyleControls({ style, ramps, busy, onApply }: Props) {
         <label htmlFor="style-ramp">
           <Palette size={13} /> Colour ramp
         </label>
-        <div className="style-ramp">
-          <span className="ramp-swatch" style={{ background: gradient(current) }} aria-hidden="true" />
-          <select
-            id="style-ramp"
-            className="input style-input"
-            value={style.ramp}
-            disabled={busy}
-            onChange={(e) => pickRamp(e.target.value)}
-          >
-            <optgroup label="This map">
-              <option value="original">Original colours</option>
-            </optgroup>
-            {groups.map((group) => (
-              <optgroup key={group} label={group === "QGIS" ? "QGIS colour ramps" : `${group} palettes`}>
-                {ramps
-                  .filter((r) => r.group === group)
-                  .map((r) => (
-                    <option key={r.id} value={r.id}>
-                      {r.name}
-                    </option>
-                  ))}
-              </optgroup>
-            ))}
-          </select>
-        </div>
+        <RampPicker id="style-ramp" value={style.ramp} groups={groups} disabled={busy} onChange={pickRamp} />
       </div>
 
       <div className="style-field">
