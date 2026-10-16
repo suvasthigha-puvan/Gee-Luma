@@ -36,6 +36,25 @@ _HISTOGRAM_BINS = 20
 # few extreme pixels stretch the bins so far that every percentile comes out
 # the same.
 _EXACT_PERCENTILE_PIXELS = 1_000_000
+# A large region with a heavy image (a country-wide composite computed on the
+# fly) fails within seconds with "User memory limit exceeded". Earth Engine
+# then gets the same request split into smaller pieces (tileScale), which is
+# slower but fits; small regions keep the fast single pass.
+_TILE_SCALES = (1, 4, 16)
+
+
+def _get_info(build):
+    """
+    Evaluate build(tile_scale) on Earth Engine, retrying with a larger tile
+    scale when it runs out of memory.
+    """
+    for tile_scale in _TILE_SCALES:
+        try:
+            return build(tile_scale).getInfo()
+        except Exception as e:
+            if "memory" not in str(e).lower() or tile_scale == _TILE_SCALES[-1]:
+                raise
+            print(f"Statistics ran out of memory at tileScale={tile_scale}; retrying in smaller pieces")
 
 
 def _region_area_km2(region_geom) -> ee.Number:
@@ -57,22 +76,28 @@ def continuous_stats(img: ee.Image, band: str, region_geom, vmin: float, vmax: f
                    .combine(ee.Reducer.minMax(), sharedInputs=True)
                    .combine(ee.Reducer.stdDev(), sharedInputs=True)
                    .combine(ee.Reducer.count(), sharedInputs=True))
-        kwargs = dict(geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_MAX_PIXELS)
-        request = {
-            "stats": image.reduceRegion(reducer=reducer, **kwargs),
-            "percentiles": image.reduceRegion(
-                reducer=ee.Reducer.percentile([10, 50, 90], maxRaw=_EXACT_PERCENTILE_PIXELS),
-                geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_EXACT_PERCENTILE_PIXELS),
-            # Area that actually has data (not masked by cloud or missing).
-            "valid_km2": ee.Number(
-                ee.Image.pixelArea().updateMask(image.mask()).rename("area")
-                .reduceRegion(reducer=ee.Reducer.sum(), **kwargs).get("area")).divide(1e6),
-            "area_km2": _region_area_km2(region_geom),
-        }
-        if vmax > vmin:
-            request["hist"] = image.reduceRegion(
-                reducer=ee.Reducer.fixedHistogram(vmin, vmax, _HISTOGRAM_BINS), **kwargs).get(band)
-        result = ee.Dictionary(request).getInfo()
+
+        def build(tile_scale):
+            kwargs = dict(geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_MAX_PIXELS,
+                          tileScale=tile_scale)
+            request = {
+                "stats": image.reduceRegion(reducer=reducer, **kwargs),
+                "percentiles": image.reduceRegion(
+                    reducer=ee.Reducer.percentile([10, 50, 90], maxRaw=_EXACT_PERCENTILE_PIXELS),
+                    geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_EXACT_PERCENTILE_PIXELS,
+                    tileScale=tile_scale),
+                # Area that actually has data (not masked by cloud or missing).
+                "valid_km2": ee.Number(
+                    ee.Image.pixelArea().updateMask(image.mask()).rename("area")
+                    .reduceRegion(reducer=ee.Reducer.sum(), **kwargs).get("area")).divide(1e6),
+                "area_km2": _region_area_km2(region_geom),
+            }
+            if vmax > vmin:
+                request["hist"] = image.reduceRegion(
+                    reducer=ee.Reducer.fixedHistogram(vmin, vmax, _HISTOGRAM_BINS), **kwargs).get(band)
+            return ee.Dictionary(request)
+
+        result = _get_info(build)
     except Exception as e:
         print(f"Statistics failed: {e}")
         return None
@@ -119,14 +144,18 @@ def class_stats(class_img: ee.Image, band: str, region_geom, labels: dict | None
     Returns rows sorted by area, largest first, or None on failure.
     """
     try:
-        grouped = (ee.Image.pixelArea().addBands(class_img.select([band]))
-                   .reduceRegion(
-                       reducer=ee.Reducer.sum().group(groupField=1, groupName="value"),
-                       geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_MAX_PIXELS * 10))
-        result = ee.Dictionary({
-            "groups": grouped.get("groups"),
-            "area_km2": _region_area_km2(region_geom),
-        }).getInfo()
+        def build(tile_scale):
+            grouped = (ee.Image.pixelArea().addBands(class_img.select([band]))
+                       .reduceRegion(
+                           reducer=ee.Reducer.sum().group(groupField=1, groupName="value"),
+                           geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_MAX_PIXELS * 10,
+                           tileScale=tile_scale))
+            return ee.Dictionary({
+                "groups": grouped.get("groups"),
+                "area_km2": _region_area_km2(region_geom),
+            })
+
+        result = _get_info(build)
     except Exception as e:
         print(f"Class statistics failed: {e}")
         return None
@@ -176,12 +205,17 @@ def series_stats(images: list, labels: list[str], band: str, region_geom, scale:
         reducer = (ee.Reducer.mean()
                    .combine(ee.Reducer.minMax(), sharedInputs=True)
                    .combine(ee.Reducer.stdDev(), sharedInputs=True))
-        kwargs = dict(geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_MAX_PIXELS)
-        result = ee.Dictionary({
-            "stats": values.reduceRegion(reducer=reducer, **kwargs),
-            "valid_m2": valid.reduceRegion(reducer=ee.Reducer.sum(), **kwargs),
-            "area_km2": _region_area_km2(region_geom),
-        }).getInfo()
+
+        def build(tile_scale):
+            kwargs = dict(geometry=region_geom, scale=scale, bestEffort=True, maxPixels=_MAX_PIXELS,
+                          tileScale=tile_scale)
+            return ee.Dictionary({
+                "stats": values.reduceRegion(reducer=reducer, **kwargs),
+                "valid_m2": valid.reduceRegion(reducer=ee.Reducer.sum(), **kwargs),
+                "area_km2": _region_area_km2(region_geom),
+            })
+
+        result = _get_info(build)
     except Exception as e:
         print(f"Series statistics failed: {e}")
         return None
