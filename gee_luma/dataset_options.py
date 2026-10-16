@@ -23,6 +23,8 @@ import json
 import re
 from datetime import date, timedelta
 
+import ee
+
 from gee_luma.catalog_search import (
     _load_catalogs, _DATASET_NAMES, RECOMMENDED_DATASETS, recommended_for, search_gee_catalog,
 )
@@ -142,10 +144,11 @@ def _json(answer) -> dict:
     return json.loads(text[text.index("{"): text.rindex("}") + 1])
 
 
-def _shortlist(prompt: str, named: str, family: list[dict], llm) -> tuple[list[str], dict]:
+def _shortlist(prompt: str, named: str, family: list[dict], llm) -> tuple[list[str], dict, list | None]:
     """
     First pass, over the whole family: the IDs of the datasets that may suit
-    the request, and the period it asks for ({} if it names none).
+    the request, the period it asks for ({} if it names none), and an
+    approximate [west, south, east, north] box of the place (None if unknown).
     """
     listing = "\n".join(
         f"{d['id']} | {d.get('title', '')} | {', '.join(str(d.get('tags', '')).split(', ')[:8])}"
@@ -175,12 +178,18 @@ def _shortlist(prompt: str, named: str, family: list[dict], llm) -> tuple[list[s
         f"Also give the period the request asks for. Today is {today}: \"last 3 months\" means the three "
         f"months ending {today}, \"this year\" means {today[:4]}. Use null for both dates when the request "
         "names no period.\n"
+        "Also give an approximate bounding box of the place the map is of, in decimal degrees "
+        "(null when the request names no place).\n"
         'Return ONLY valid JSON: {"period": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}, '
-        '"ids": ["<id exactly as listed>", ...]}'
+        '"place_bbox": [west, south, east, north], "ids": ["<id exactly as listed>", ...]}'
     )
     parsed = _json(answer)
     period = parsed.get("period") if isinstance(parsed.get("period"), dict) else {}
-    return [str(i).strip() for i in parsed.get("ids", [])], period
+    box = parsed.get("place_bbox")
+    if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)
+            and -180 <= box[0] <= box[2] <= 180 and -90 <= box[1] <= box[3] <= 90):
+        box = None
+    return [str(i).strip() for i in parsed.get("ids", [])], period, box
 
 
 def _confirm(prompt: str, named: str, options: list[dict], llm) -> list[dict]:
@@ -219,7 +228,9 @@ def _confirm(prompt: str, named: str, options: list[dict], llm) -> list[dict]:
 def _resolution_text(metres) -> str:
     if not metres:
         return ""
-    return f"{metres / 1000:.3g} km" if metres >= 1000 else f"{round(metres):g} m"
+    if metres >= 1000:
+        return f"{metres / 1000:.3g} km"
+    return f"{metres:.2g} m" if metres < 10 else f"{round(metres):g} m"     # 0.5 m, 2.5 m, 30 m
 
 
 def _cadence_text(cadence: str) -> str:
@@ -251,7 +262,57 @@ def _outside_period(meta: dict, period: dict) -> bool:
     return bool(meta["date_end"]) and date.fromisoformat(meta["date_end"]) < start - timedelta(days=366)
 
 
-def _describe(dataset: dict, note: str, period: dict) -> dict | None:
+def _overlaps(boxes: list, bounds: dict) -> bool:
+    """True when any of the dataset's [west, south, east, north] boxes touches the region's bounds."""
+    for west, south, east, north in boxes:
+        if south > bounds["lat_max"] or north < bounds["lat_min"]:
+            continue
+        # A box crossing the antimeridian has west > east.
+        spans = [(west, east)] if west <= east else [(west, 180.0), (-180.0, east)]
+        if any(w <= bounds["lon_max"] and e >= bounds["lon_min"] for w, e in spans):
+            return True
+    return False
+
+
+def _is_global(boxes: list) -> bool:
+    """True when the dataset's published extent spans the whole width of the globe."""
+    return any(west <= -170 and east >= 170 for west, _south, east, _north in boxes)
+
+
+def _ids_without_data(kinds: dict, bounds: dict) -> set:
+    """
+    The datasets of {id: "image" | "image_collection"} that have no image over
+    the region, asked of Earth Engine in one request. A published extent can
+    be far wider than the data (USGS 3DEP lists a box spanning the Pacific for
+    a US-only product); the images' own footprints are what count.
+    """
+    if not kinds:
+        return set()
+    region = ee.Geometry.Rectangle([bounds["lon_min"], bounds["lat_min"], bounds["lon_max"], bounds["lat_max"]])
+    checks = {
+        dataset_id: (ee.Image(dataset_id).geometry().intersects(region, ee.ErrorMargin(1000)) if kind == "image"
+                     else ee.ImageCollection(dataset_id).filterBounds(region).limit(1).size().gt(0))
+        for dataset_id, kind in kinds.items()
+    }
+    try:
+        found = ee.Dictionary(checks).getInfo()
+    except Exception:
+        return set()            # could not check: offer them all, as before
+    return {dataset_id for dataset_id, has_data in found.items() if not has_data}
+
+
+def _countries_in(bounds: dict) -> list[str]:
+    """Names of the countries the region's bounding box touches (at most five), or [] if unknown."""
+    try:
+        box = ee.Geometry.Rectangle([bounds["lon_min"], bounds["lat_min"], bounds["lon_max"], bounds["lat_max"]])
+        names = (ee.FeatureCollection("WM/geoLab/geoBoundaries/600/ADM0").filterBounds(box)
+                 .aggregate_array("shapeName").distinct().getInfo())
+        return [str(n) for n in names][:5]
+    except Exception:
+        return []
+
+
+def _describe(dataset: dict, note: str, period: dict, bounds: dict | None = None) -> dict | None:
     """One option as shown to the person, or None if the catalog says it should not be offered."""
     option = {
         "id": dataset["id"], "title": dataset.get("title") or dataset["id"],
@@ -263,6 +324,10 @@ def _describe(dataset: dict, note: str, period: dict) -> dict | None:
     if meta:
         if meta["deprecated"] or meta["type"] not in _IMAGE_TYPES or _outside_period(meta, period):
             return None
+        if bounds and meta.get("bbox") and not _overlaps(meta["bbox"], bounds):
+            return None         # the dataset's published extent misses the region
+        if meta.get("bbox") and not _is_global(meta["bbox"]):
+            option["regional"] = meta["type"]       # its image footprints are checked against the region
         option["title"] = meta["title"] or option["title"]
         option["provider"] = meta["provider"] or option["provider"]
         option["resolution_m"] = meta["gsd"]
@@ -273,7 +338,8 @@ def _describe(dataset: dict, note: str, period: dict) -> dict | None:
     return option
 
 
-def find_dataset_options(prompt: str, llm) -> dict | None:
+def find_dataset_options(prompt: str, llm, region_bounds: dict | None = None,
+                         region_label: str = "") -> dict | None:
     """
     {"named": the dataset name as the request wrote it ("" if it names none),
     "options": [...]} when two or more datasets fit the request; else None.
@@ -282,17 +348,39 @@ def find_dataset_options(prompt: str, llm) -> dict | None:
     family; one that names none ("rainfall in Sri Lanka") is offered the
     datasets on its theme from the whole catalog, the standard one first.
 
+    Datasets with no data over the place are left out: the uploaded region's
+    bounds when there is one (region_bounds: {lon_min, lon_max, lat_min,
+    lat_max}), otherwise the language model's box for the place named in the
+    request. With an uploaded region the request text does not say where the
+    map is ("the uploaded area"), so the language model is also told.
+
     Never raises: if the catalog or the language model cannot be reached the
     request simply goes ahead without a question.
     """
     try:
+        # What the language model reads: the request, plus where an uploaded region lies.
+        request = prompt
+        if region_bounds:
+            countries = _countries_in(region_bounds)
+            b = region_bounds
+            request = (f'{prompt} [The map covers the user\'s uploaded region "{region_label or "region"}", '
+                       + (f"in {', '.join(countries)}, " if countries else "")
+                       + f"longitude {b['lon_min']:.2f} to {b['lon_max']:.2f}, "
+                       f"latitude {b['lat_min']:.2f} to {b['lat_max']:.2f}.]")
         names = named_datasets(prompt)
         named = " ".join(text for _name, text in names)
         family = _family([name for name, _text in names]) if names else _whole_catalog()
         if len(family) < 2 or _names_one_product(prompt, family):
             return None
         by_id = {d["id"]: d for d in family}
-        ids, period = _shortlist(prompt, named, family[:MAX_CANDIDATES] if names else family, llm)
+        ids, period, place_box = _shortlist(request, named, family[:MAX_CANDIDATES] if names else family, llm)
+        bounds = region_bounds
+        if not bounds and place_box:
+            # The language model's box is approximate: widen it so a dataset
+            # that does cover the place is never left out.
+            west, south, east, north = place_box
+            bounds = {"lon_min": max(west - 1, -180), "lon_max": min(east + 1, 180),
+                      "lat_min": max(south - 1, -90), "lat_max": min(north + 1, 90)}
         # The standard dataset for the theme is always among the options, and leads them.
         standard = [] if names else [rec_id for rec_id, _title in recommended_for(prompt) if rec_id in by_id]
         if not names:
@@ -300,14 +388,18 @@ def find_dataset_options(prompt: str, llm) -> dict | None:
         shortlist = {}
         for dataset_id in (standard + ids)[:MAX_OPTIONS * 2 + 2]:
             if dataset_id in by_id and dataset_id not in shortlist:
-                option = _describe(by_id[dataset_id], "", period)
+                option = _describe(by_id[dataset_id], "", period, bounds)
                 if option:
                     option["standard"] = dataset_id in standard
                     shortlist[dataset_id] = option
+        if bounds:
+            regional = {i: o["regional"] for i, o in shortlist.items() if o.get("regional")}
+            for dataset_id in _ids_without_data(regional, bounds):
+                shortlist.pop(dataset_id, None)
         if len(shortlist) < 2:
             return None
         options = []
-        for pick in _confirm(prompt, named, list(shortlist.values()), llm):
+        for pick in _confirm(request, named, list(shortlist.values()), llm):
             option = shortlist.pop(str(pick.get("id", "")).strip(), None)
             if option:
                 option["note"] = str(pick.get("note") or "").strip().rstrip(".")
@@ -316,6 +408,7 @@ def find_dataset_options(prompt: str, llm) -> dict | None:
         options = [o for o in shortlist.values() if o["standard"]] + options
         for option in options:
             option.pop("tags")
+            option.pop("regional", None)
             if option["standard"] and not option["note"]:
                 option["note"] = "Standard choice for this kind of map"
         if len(options) < 2:

@@ -314,7 +314,10 @@ def run_pipeline(user_prompt: str, *, llm, ui, uploaded_region_geojson=None, upl
             ui.error(problem)
             ui.stop()
         with ui.spinner("Checking which datasets fit your request..."):
-            dataset_options = find_dataset_options(user_prompt, llm)
+            dataset_options = find_dataset_options(
+                user_prompt, llm,
+                region_bounds=get_geojson_bounds(uploaded_region_geojson) if uploaded_region_geojson else None,
+                region_label=uploaded_region_label or "")
         if dataset_options:
             return {"dataset_options": dataset_options}
     chosen_dataset = "" if dataset == AUTO_CHOICE else dataset
