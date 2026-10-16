@@ -13,17 +13,15 @@ Run with:
 
 import inspect
 import json
-import os
 from pathlib import Path
 
 import ee
 import streamlit as st
-from dotenv import load_dotenv
-
+from gee_luma import settings
 from gee_luma.pipeline import (
-    run_pipeline, render_original_map, create_llm,
-    PALETTE_PRESETS, EE_PROJECT, SPYNDEX_AVAILABLE,
+    run_pipeline, render_original_map, create_llm, PALETTE_PRESETS, SPYNDEX_AVAILABLE,
 )
+from gee_luma.dataset_options import AUTO_CHOICE, option_summary
 from gee_luma.utils import ascii_label
 from gee_luma.styles import (
     inject_css, SIDEBAR_WORDMARK, GUIDANCE_HTML,
@@ -64,6 +62,13 @@ st.set_page_config(
 
 inject_css()
 
+# ====================== SETTINGS ======================
+# Kept in the .env file, which the web app's setup window writes (python server.py).
+EE_PROJECT, LLM_MODEL = settings.get("EE_PROJECT"), settings.get("LLM_MODEL")
+if not EE_PROJECT or not LLM_MODEL:
+    st.error("Gee-Luma is not set up yet. Run `python server.py` once and fill in the setup window.")
+    st.stop()
+
 # ====================== GEE AUTH ======================
 if "ee_initialized" not in st.session_state:
     try:
@@ -74,14 +79,12 @@ if "ee_initialized" not in st.session_state:
         st.stop()
 
 # ====================== OPENAI SETUP ======================
-load_dotenv()
-
 if "crew_ready" not in st.session_state:
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = settings.get("LLM_API_KEY")
     if not api_key:
-        api_key = st.text_input("Enter your OpenAI API Key", type="password")
+        api_key = st.text_input("Enter your AI API key", type="password")
     if api_key:
-        st.session_state.llm = create_llm(api_key)
+        st.session_state.llm = create_llm(api_key, LLM_MODEL)
         st.session_state.crew_ready = True
 
 # ====================== SIDEBAR ======================
@@ -178,6 +181,7 @@ user_prompt = st.text_area(
         "- NO2 air pollution over Europe using Sentinel-5P\n"
         "- MNDWI water index for the Nile Delta, max 15% cloud cover\n"
         "- Evapotranspiration over India 2023 using MODIS MOD16A2GF\n"
+        "- Monthly ET maps of Sri Lanka for 2025 (12 maps in one figure)\n"
         "- VIIRS EVI2 for West Africa 2024"
     ),
     height=140,
@@ -200,26 +204,67 @@ with col1:
     generate = st.button("GENERATE MAP", type="primary", **_stretch(st.button))
 
 # ====================== MAIN GENERATION LOGIC ======================
-if generate and user_prompt and "llm" in st.session_state:
-
+def run_request(request: dict, dataset: str = ""):
+    """Run the pipeline for `request` and keep what it returns for the sections below."""
     # A new request replaces the previous map, even if this one fails.
     st.session_state.pop("last_result", None)
+    st.session_state.pop("pending_choice", None)
 
-    result_data = run_pipeline(
-        user_prompt,
-        llm=st.session_state.llm,
-        ui=st,
-        uploaded_region_geojson=uploaded_region_geojson,
-        uploaded_region_label=uploaded_region_label,
-        map_title_override=map_title_override,
-        selected_palette=selected_palette,
-        fill_gaps_option=fill_gaps_option,
-    )
-    if result_data:
+    result_data = run_pipeline(request["prompt"], llm=st.session_state.llm, ui=st, dataset=dataset,
+                               **request["options"])
+    if result_data and result_data.get("dataset_options"):
+        # Several datasets fit: the request waits until one is picked below.
+        st.session_state["pending_choice"] = {"request": request, **result_data["dataset_options"]}
+    elif result_data:
         st.session_state["last_result"] = result_data
+
+
+if generate and user_prompt and "llm" in st.session_state:
+    run_request({
+        "prompt": user_prompt,
+        "options": {
+            "uploaded_region_geojson": uploaded_region_geojson,
+            "uploaded_region_label": uploaded_region_label,
+            "map_title_override": map_title_override,
+            "selected_palette": selected_palette,
+            "fill_gaps_option": fill_gaps_option,
+        },
+    })
 
 elif generate and "llm" not in st.session_state:
     st.warning("Please enter your OpenAI API key first.")
+
+# ====================== DATASET CHOICE ======================
+# A request such as "NDVI using MODIS" fits several datasets. Nothing is
+# processed until the person says which one they mean.
+if "pending_choice" in st.session_state:
+    pending = st.session_state["pending_choice"]
+    options = pending["options"]
+    choice_box = st.empty()
+    with choice_box.container():
+        st.markdown(section_label("Choose a dataset"), unsafe_allow_html=True)
+        st.info(
+            f"**{' '.join(filter(None, [str(len(options)), ascii_label(pending['named'])]))} datasets** "
+            "fit this request: "
+            f"*{pending['request']['prompt']}*\n\n"
+            "Pick the one to use - nothing has been processed yet."
+        )
+        picked = st.radio(
+            "Dataset",
+            range(len(options)),
+            format_func=lambda i: (f"{ascii_label(options[i]['title'])}  ({options[i]['id']})"
+                                   + ("  - standard choice" if options[i].get("standard") else "")),
+            captions=[" - ".join(t for t in (option_summary(o), ascii_label(o["note"])) if t) for o in options],
+            label_visibility="collapsed",
+        )
+        c1, c2, _c3 = st.columns([1.4, 1.4, 3])
+        with c1:
+            use_picked = st.button("USE THIS DATASET", type="primary", **_stretch(st.button))
+        with c2:
+            use_auto = st.button("Let Gee-Luma choose", **_stretch(st.button))
+    if use_picked or use_auto:
+        choice_box.empty()
+        run_request(pending["request"], dataset=AUTO_CHOICE if use_auto else options[picked]["id"])
 
 # ====================== MAP OUTPUT ======================
 # Rendered from session state so the map stays on screen across reruns.
@@ -233,7 +278,8 @@ if "last_result" in st.session_state:
     with m2:
         st.markdown(metric_card(res["region"], "Region"), unsafe_allow_html=True)
     with m3:
-        st.markdown(metric_card(str(res["n_images"]), "Scenes"), unsafe_allow_html=True)
+        scenes = str(res["n_images"]) + (f" in {len(res['panels'])} maps" if res.get("series") else "")
+        st.markdown(metric_card(scenes, "Scenes"), unsafe_allow_html=True)
     with m4:
         st.markdown(metric_card(res["engine"], "Engine"), unsafe_allow_html=True)
 
@@ -300,7 +346,7 @@ if "last_result" in st.session_state:
             if st.button("Prepare GeoTIFF", **_stretch(st.button)):
                 try:
                     with st.spinner("Downloading GeoTIFF from Earth Engine..."):
-                        geotiff["bytes"] = fetch_geotiff(geotiff["url"])
+                        geotiff["bytes"] = fetch_geotiff(geotiff)
                     st.rerun()
                 except Exception as e:
                     st.error(f"GeoTIFF export failed: {e}")
@@ -328,7 +374,22 @@ if "last_result" in st.session_state:
                     "missing from the dataset"
                     + (", even after gap filling." if res.get("gap_fill") else ". A longer period usually fills the gaps.")
                 )
-        if stats["kind"] == "categorical":
+        if stats["kind"] == "series":
+            # One row per map of the figure.
+            st.caption(f"{res['value_label']} over the region, for each map.")
+            st.dataframe(pd.DataFrame([
+                {"Map": r["label"], "Mean": format_value(r["mean"]), "Minimum": format_value(r["min"]),
+                 "Maximum": format_value(r["max"]), "Std dev": format_value(r["std"]),
+                 "Data (%)": "-" if r["coverage_percent"] is None else f"{r['coverage_percent']:.0f}"}
+                for r in stats["rows"]
+            ]), hide_index=True, **_stretch(st.dataframe))
+        elif stats["kind"] == "series_categorical":
+            st.caption("Share of the mapped area (%) taken by each class, for each map.")
+            st.dataframe(pd.DataFrame([
+                {"Class": r["class"], **{label: round(pct, 2) for label, pct in zip(stats["panels"], r["percent"])}}
+                for r in stats["rows"]
+            ]), hide_index=True, **_stretch(st.dataframe))
+        elif stats["kind"] == "categorical":
             table = pd.DataFrame([
                 {"Class": r["class"], "Area (km2)": round(r["area_km2"], 2), "Share (%)": round(r["percent"], 2)}
                 for r in stats["rows"]

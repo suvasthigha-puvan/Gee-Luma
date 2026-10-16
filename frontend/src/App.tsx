@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Moon, Sun } from "lucide-react";
+import { Moon, Settings, Sun } from "lucide-react";
 import { api, ApiError } from "./api";
-import type { Job, JobSummary, MapRequest, Meta, RegionUpload } from "./types";
+import type { Job, JobSummary, MapRequest, Meta, RegionUpload, Setup } from "./types";
 import { Composer } from "./components/Composer";
 import { Welcome } from "./components/Welcome";
 import { Progress } from "./components/Progress";
 import { ResultView } from "./components/ResultView";
 import { Failure } from "./components/Failure";
+import { DatasetChoice } from "./components/DatasetChoice";
+import { SetupDialog, type SetupMode } from "./components/SetupDialog";
 
 const POLL_MS = 1500;
 
@@ -40,6 +42,8 @@ export default function App() {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [metaError, setMetaError] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [setup, setSetup] = useState<Setup | null>(null);
+  const [dialog, setDialog] = useState<{ mode: SetupMode; project?: string } | null>(null);
 
   // What the person is composing
   const [prompt, setPrompt] = useState("");
@@ -52,8 +56,15 @@ export default function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [recent, setRecent] = useState<JobSummary[]>([]);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [missingMap, setMissingMap] = useState(false);    // a map link (?map=id) the server does not know
   const [submitting, setSubmitting] = useState(false);
   const pollTimer = useRef<number | null>(null);
+  const missingMapBanner = useRef<HTMLDivElement | null>(null);
+
+  // On a narrow screen the stage is below the composer: bring the notice into view.
+  useEffect(() => {
+    if (missingMap) missingMapBanner.current?.scrollIntoView({ block: "nearest" });
+  }, [missingMap]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -71,7 +82,32 @@ export default function App() {
   useEffect(() => {
     api.meta().then(setMeta).catch((e: Error) => setMetaError(e.message));
     refreshRecent();
+    // The first time (nothing saved yet, or it no longer works) the setup window opens by itself.
+    api
+      .setup()
+      .then((s) => {
+        setSetup(s);
+        if (!s.configured) setDialog({ mode: "setup" });
+      })
+      .catch(() => undefined);
   }, [refreshRecent]);
+
+  const openSettings = (mode: SetupMode = "settings", project?: string) => {
+    api
+      .setup()
+      .then((s) => {
+        setSetup(s);
+        setDialog({ mode, project });
+      })
+      .catch((e: Error) => setSubmitError(e.message));
+  };
+
+  const setupSaved = (s: Setup) => {
+    setSetup(s);
+    setDialog(null);
+    setSubmitError(null);
+    api.meta().then(setMeta).catch((e: Error) => setMetaError(e.message));
+  };
 
   const stopPolling = () => {
     if (pollTimer.current !== null) {
@@ -83,6 +119,7 @@ export default function App() {
   const follow = useCallback(
     (id: string) => {
       stopPolling();
+      setMissingMap(false);
       const tick = async () => {
         try {
           const next = await api.job(id);
@@ -93,7 +130,11 @@ export default function App() {
             refreshRecent();
           }
         } catch (e) {
-          setSubmitError(e instanceof ApiError ? e.message : "Lost contact with the server.");
+          if (e instanceof ApiError && e.status === 404) {
+            setMissingMap(true);        // shown on the stage, where the map was expected
+          } else {
+            setSubmitError(e instanceof ApiError ? e.message : "Lost contact with the server.");
+          }
           // A map from an earlier server run no longer exists: go back to the start.
           setJob((current) => (current && current.id === id && current.steps.length === 0 ? null : current));
           writeMapIdToUrl(null);
@@ -132,13 +173,23 @@ export default function App() {
     }
   };
 
+  const chooseDataset = async (id: string, dataset: string) => {
+    setSubmitError(null);
+    try {
+      await api.chooseDataset(id, dataset);
+      follow(id);
+    } catch (e) {
+      setSubmitError(e instanceof Error ? e.message : "The choice could not be sent.");
+    }
+  };
+
   const openJob = (id: string) => {
     setSubmitError(null);
     follow(id);
   };
 
   const busy = submitting || job?.status === "queued" || job?.status === "running";
-  const problems = metaError ? [metaError] : meta?.problems ?? [];
+  const ready = !metaError && !!meta?.ready;
 
   return (
     <div className="app">
@@ -154,12 +205,25 @@ export default function App() {
         </div>
         <div className="topbar-right">
           {meta && (
-            <div className={`status-pill ${problems.length ? "is-down" : "is-up"}`}>
+            <button
+              className={`status-pill ${ready ? "is-up" : "is-down"}`}
+              onClick={() => openSettings(ready ? "settings" : "setup")}
+              title={ready ? `Earth Engine project: ${setup?.project ?? ""}` : "Open the setup"}
+            >
               <span className="status-dot" />
-              {problems.length ? "Setup needed" : "Earth Engine connected"}
-              {!problems.length && <span className="status-sep">{meta.model}</span>}
-            </div>
+              {ready ? "Earth Engine connected" : "Setup needed"}
+              {ready && <span className="status-sep">{setup?.project}</span>}
+              {ready && <span className="status-sep">{meta.model}</span>}
+            </button>
           )}
+          <button
+            className="icon-button"
+            onClick={() => openSettings()}
+            aria-label="Settings"
+            title="Settings: Earth Engine project and AI key"
+          >
+            <Settings size={17} />
+          </button>
           <button
             className="icon-button"
             onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
@@ -185,7 +249,7 @@ export default function App() {
           region={region}
           onRegion={setRegion}
           busy={!!busy}
-          disabled={problems.length > 0}
+          disabled={!ready}
           onGenerate={generate}
           error={submitError}
           recent={recent}
@@ -194,23 +258,62 @@ export default function App() {
         />
 
         <main className="stage">
-          {problems.length > 0 && (
+          {metaError && (
             <div className="banner banner-error" role="alert">
               <strong>The server is not ready.</strong>
-              {problems.map((p) => (
-                <div key={p}>{p}</div>
-              ))}
+              <div>{metaError}</div>
+            </div>
+          )}
+          {meta && !ready && !dialog && (
+            <div className="banner banner-info">
+              <strong>Finish the setup to start making maps.</strong>{" "}
+              <button className="link-button" onClick={() => openSettings("setup")}>
+                Open the setup
+              </button>
+            </div>
+          )}
+
+          {missingMap && (
+            <div className="banner banner-error" role="alert" ref={missingMapBanner}>
+              <strong>This map could not be opened.</strong>
+              <div>
+                The link may be wrong, or the map is no longer kept: the server holds only its most recent maps,
+                and none from before it restarted. Describe the map again to generate it.
+              </div>
             </div>
           )}
 
           {!job && <Welcome meta={meta} onPick={setPrompt} />}
           {job && (job.status === "queued" || job.status === "running") && <Progress job={job} />}
-          {job && job.status === "error" && <Failure job={job} onRetry={generate} canRetry={!!prompt.trim()} />}
+          {job && job.status === "choice" && job.choice && (
+            <DatasetChoice key={job.id} job={job} choice={job.choice} onChoose={(d) => chooseDataset(job.id, d)} />
+          )}
+          {job && job.status === "error" && (
+            <Failure
+              job={job}
+              onRetry={generate}
+              canRetry={!!prompt.trim() && ready}
+              currentProject={setup?.project ?? ""}
+              onSwitchProject={(project) => openSettings("switch-project", project)}
+              onOpenSettings={() => openSettings()}
+            />
+          )}
           {job && job.status === "done" && job.result && (
-            <ResultView key={job.id} job={job} result={job.result} onJobChange={setJob} />
+            <ResultView key={job.id} job={job} result={job.result} onJobChange={setJob} ramps={meta?.ramps ?? []} />
           )}
         </main>
       </div>
+
+      {dialog && setup && (
+        <SetupDialog
+          key={dialog.mode}
+          mode={dialog.mode}
+          setup={setup}
+          limitedProject={dialog.project}
+          onSaved={setupSaved}
+          onClose={() => setDialog(null)}
+        />
+      )}
     </div>
   );
 }

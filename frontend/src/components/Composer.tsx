@@ -200,6 +200,7 @@ export function Composer(p: Props) {
                         {j.status === "done" && timeAgo(j.created)}
                         {j.status === "error" && "Failed"}
                         {(j.status === "running" || j.status === "queued") && "In progress"}
+                        {j.status === "choice" && "Waiting for your dataset choice"}
                       </span>
                     </span>
                   </button>

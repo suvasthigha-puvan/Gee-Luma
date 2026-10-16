@@ -137,6 +137,12 @@ def fetch_dataset_metadata(cid: str) -> dict[str, Any] | None:
     if isinstance(summary_gsd, (int, float)):
         gsd_values.append(summary_gsd)
     providers = [p.get("name", "") for p in doc.get("providers", []) if p.get("name")]
+    # Area the dataset covers, as [west, south, east, north] boxes in degrees.
+    bbox = (doc.get("extent", {}).get("spatial", {}) or {}).get("bbox") or []
+    if bbox and isinstance(bbox[0], (int, float)):
+        bbox = [bbox]
+    bbox = [list(map(float, b[:4])) for b in bbox
+            if isinstance(b, list) and len(b) >= 4 and all(isinstance(v, (int, float)) for v in b[:4])]
 
     return {
         "id": doc.get("id", cid),
@@ -149,6 +155,7 @@ def fetch_dataset_metadata(cid: str) -> dict[str, Any] | None:
                     if cadence.get("interval") else ""),
         "deprecated": bool(doc.get("deprecated")) or "[deprecated]" in str(doc.get("title", "")),
         "gsd": min(gsd_values) if gsd_values else None,
+        "bbox": bbox,
         "bands": bands,
         "visualizations": visualizations,
     }

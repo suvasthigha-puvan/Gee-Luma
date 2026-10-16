@@ -11,7 +11,7 @@ export function Progress({ job }: { job: Job }) {
     return () => window.clearInterval(timer);
   }, []);
 
-  const elapsed = Math.max(job.elapsed, now - job.created);
+  const elapsed = Math.max(job.elapsed, now - job.created - (job.waited ?? 0));
   const messages = job.notes.filter((n) => n.level === "info" || n.level === "warning");
 
   return (

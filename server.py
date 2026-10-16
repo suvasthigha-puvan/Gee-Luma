@@ -3,7 +3,11 @@ server.py
 ---------
 Web API for Gee-Luma and host of the React interface.
 
-    python server.py            -> http://localhost:8000
+    python server.py            -> opens http://localhost:<PORT> in the browser
+    python server.py --no-browser
+
+Settings (EE_PROJECT, LLM_MODEL, LLM_API_KEY, PORT) are kept in the .env
+file only. The app's setup window writes them; see gee_luma/settings.py.
 
 A map takes one to several minutes, so requests are jobs: the browser posts
 a request, gets a job id back at once, and polls the job for progress and
@@ -12,11 +16,17 @@ rendering and matplotlib are not safe to run concurrently in one process).
 
 Endpoints
     GET  /api/meta                       what the server can do, example requests
+    GET  /api/setup                      sign-in, project and AI settings, and whether they work
+    POST /api/setup                      check and save the settings
+    POST /api/setup/signin               start the Google sign-in for Earth Engine
+    GET  /api/setup/signin               how the sign-in is going
     POST /api/region                     validate an uploaded GeoJSON region
     POST /api/maps                       start a map job
     GET  /api/maps                       recent jobs
     GET  /api/maps/{id}                  job progress and result
+    POST /api/maps/{id}/dataset          continue a job that is waiting for a dataset choice
     POST /api/maps/{id}/original         render the original (not gap-filled) map
+    POST /api/maps/{id}/style            change a finished map's colour ramp and legend range
     GET  /api/maps/{id}/file/{name}      map.png, map.pdf, stats.csv, data.tif,
                                          original.png, original.pdf
 
@@ -26,38 +36,50 @@ Results are kept in memory only; they are gone when the server stops.
 from __future__ import annotations
 
 import json
-import os
+import math
 import re
+import sys
 import threading
 import time
 import uuid
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
-import ee
 import uvicorn
-from dotenv import load_dotenv
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from gee_luma import connections, settings
 from gee_luma.pipeline import (
-    run_pipeline, render_original_map, create_llm,
-    PALETTE_PRESETS, EE_PROJECT, LLM_MODEL, SPYNDEX_AVAILABLE,
+    run_pipeline, render_original_map, create_llm, PALETTE_PRESETS, SPYNDEX_AVAILABLE,
 )
+from gee_luma.color_ramps import QGIS_RAMPS
+from gee_luma.dataset_options import AUTO_CHOICE
 from gee_luma.exports import fetch_geotiff
+from gee_luma.restyle import fetch_values, restyle_map
 from gee_luma.geojson_helpers import _ensure_wgs84, get_geojson_bounds, get_geojson_label
 
 FRONTEND_DIR = Path(__file__).with_name("frontend") / "dist"
 MAX_JOBS_KEPT = 12
 
+# Colour ramps a finished map can be restyled with: Gee-Luma's own palettes
+# and the gradient ramps of QGIS's default style.
+RAMPS = {f"app:{name}": {"name": name, "group": "Gee-Luma", "colors": colors}
+         for name, colors in PALETTE_PRESETS.items() if colors}
+RAMPS.update({f"qgis:{name}": {"name": name, "group": "QGIS", "colors": colors}
+              for name, colors in QGIS_RAMPS.items()})
+
 EXAMPLE_REQUESTS = [
     {"label": "Vegetation", "text": "NDVI map for Sri Lanka using Sentinel-2, last 3 months"},
     {"label": "Land cover", "text": "Land cover map of Kandy district"},
     {"label": "Rainfall", "text": "Total rainfall in Sri Lanka for 2023"},
+    {"label": "Monthly maps", "text": "Monthly ET maps of Sri Lanka for 2025"},
     {"label": "True colour", "text": "True-color image of Galle district using Sentinel-2, January to March 2024"},
     {"label": "Temperature", "text": "Land surface temperature of Tamil Nadu in April 2024"},
     {"label": "Elevation", "text": "Elevation map of Nepal"},
@@ -164,34 +186,41 @@ class Job:
         self.request = request
         self.created = time.time()
         self.finished: float | None = None
-        self.status = "queued"            # queued | running | done | error
+        self.status = "queued"            # queued | running | choice | done | error
+        self.choice: dict | None = None   # datasets to pick from, while status is "choice"
+        self.paused_at: float | None = None
+        self.waited = 0.0                 # seconds spent waiting for the person's choice
         self.ui = RecordingUI()
         self.result: dict | None = None
         self.error: str | None = None
+        self.project = settings.get("EE_PROJECT")    # the Earth Engine project it runs on
 
 
 JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
 WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gee-luma")
-STATE = {"llm": None, "problems": []}
+STATE = {"llm": None, "ee_ok": False, "ee_problem": None}
+SIGN_IN = connections.SignIn()
 
 
 def _startup():
-    load_dotenv()
-    problems = []
-    try:
-        ee.Initialize(project=EE_PROJECT)
-    except Exception as e:
-        problems.append(f"Google Earth Engine could not be initialised ({e}). "
-                        "Run `earthengine authenticate` and check the project ID.")
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
-        STATE["llm"] = create_llm(api_key)
-    else:
-        problems.append("OPENAI_API_KEY is not set. Add it to a .env file next to server.py.")
-    STATE["problems"] = problems
-    for p in problems:
-        print("STARTUP PROBLEM:", p)
+    project = settings.get("EE_PROJECT")
+    if project and connections.signed_in():
+        STATE["ee_problem"] = connections.connect_earth_engine(project)
+        STATE["ee_ok"] = STATE["ee_problem"] is None
+    key, model = settings.get("LLM_API_KEY"), settings.get("LLM_MODEL")
+    STATE["llm"] = create_llm(key, model) if key and model else None
+    if not _ready():
+        print("Setup needed: open the app in the browser and fill in the setup window.")
+
+
+def _ready() -> bool:
+    return STATE["ee_ok"] and STATE["llm"] is not None
+
+
+def _busy() -> bool:
+    with JOBS_LOCK:
+        return any(j.status in ("queued", "running") for j in JOBS.values())
 
 
 def _run_job(job: Job):
@@ -207,6 +236,7 @@ def _run_job(job: Job):
             map_title_override=req.get("title") or "",
             selected_palette=req.get("palette") or "Auto (index-based)",
             fill_gaps_option=bool(req.get("fill_gaps", True)),
+            dataset=req.get("dataset") or "",
         )
     except PipelineStop:
         job.result = None
@@ -214,7 +244,23 @@ def _run_job(job: Job):
         job.ui.error(f"Unexpected error: {e}")
         job.result = None
 
+    if job.result and job.result.get("dataset_options"):
+        # Several datasets fit the request: wait for the person to pick one.
+        job.choice, job.result = job.result["dataset_options"], None
+        job.paused_at = time.time()
+        job.status = "choice"
+        job.ui.close_open_steps("complete")
+        return
+
     if job.result:
+        res = job.result
+        if res.get("restyle"):
+            # The style it was made with, kept so it can be restored exactly.
+            res["style_state"] = {"ramp": "original", **res["style"], "version": 0}
+            res["original_figure"] = {"png": res["png_bytes"], "pdf": res["pdf_bytes"]}
+            res["style_lock"] = threading.Lock()
+            # Fetch the values now, so the first change of colours is quick.
+            threading.Thread(target=_prefetch_values, args=(res["restyle"],), daemon=True).start()
         job.status = "done"
         job.ui.close_open_steps("complete")
     else:
@@ -226,9 +272,17 @@ def _run_job(job: Job):
 
     # Results hold large images; keep only the most recent jobs.
     with JOBS_LOCK:
-        finished = sorted((j for j in JOBS.values() if j.finished), key=lambda j: j.created)
+        finished = sorted((j for j in JOBS.values() if j.finished or j.status == "choice"),
+                          key=lambda j: j.created)
         for old in finished[:-MAX_JOBS_KEPT]:
             JOBS.pop(old.id, None)
+
+
+def _prefetch_values(restyle: dict):
+    try:
+        fetch_values(restyle)
+    except Exception as e:      # tried again when the person changes the colours
+        print(f"Map values for restyling not fetched yet: {e}")
 
 
 def _json_safe(value):
@@ -267,7 +321,12 @@ def _result_payload(job: Job) -> dict | None:
             "projection": res.get("projection"),
         },
         "gap_fill": res.get("gap_fill"),
+        "series": ({"kind": res["series"], "grid": res.get("grid"), "maps": res.get("panels") or []}
+                   if res.get("series") else None),
         "original_rendered": bool(res.get("original")),
+        # Colour ramp and legend range, for maps whose colours can be changed.
+        "style": ({**{k: res["style_state"][k] for k in ("ramp", "palette", "min", "max", "version")},
+                   "original": res["style"]} if res.get("style_state") else None),
         "stats": stats,
         "has_csv": bool(res.get("stats_csv")),
         "geotiff": ({k: geotiff[k] for k in ("scale_m", "native_scale_m", "resampled")} if geotiff else None),
@@ -280,18 +339,25 @@ def _job_payload(job: Job, full: bool = True) -> dict:
     with job.ui.lock:
         steps = [dict(s) for s in job.ui.steps]
         notes = [dict(n) for n in job.ui.notes]
+    errors = [n["text"] for n in notes if n["level"] == "error"] + [job.error or ""]
+    limit = connections.limit_kind(errors) if job.status == "error" else None
     payload = {
         "id": job.id,
         "status": job.status,
+        # A usage limit stopped the job: the app offers to switch project (or AI key).
+        "limit": {"kind": limit, "project": job.project} if limit else None,
         "prompt": job.request["prompt"],
         "created": job.created,
-        "elapsed": round((job.finished or time.time()) - job.created, 1),
+        "elapsed": round((job.finished or (job.status == "choice" and job.paused_at) or time.time())
+                         - job.created - job.waited, 1),
+        "waited": round(job.waited, 1),
         "error": job.error,
         "title": (job.result or {}).get("title"),
         "region": (job.result or {}).get("region"),
     }
     if full:
-        payload.update({"steps": steps, "notes": notes, "result": _result_payload(job)})
+        payload.update({"steps": steps, "notes": notes, "result": _result_payload(job),
+                        "choice": job.choice if job.status == "choice" else None})
     return payload
 
 
@@ -303,13 +369,100 @@ def api_meta(request: Request):
         import spyndex
         index_count = len(spyndex.indices)
     return JSONResponse({
-        "ready": not STATE["problems"],
-        "problems": STATE["problems"],
+        "ready": _ready(),
+        "problems": [] if _ready() else ["Finish the setup to start making maps."],
         "palettes": [{"name": name, "colors": colors} for name, colors in PALETTE_PRESETS.items()],
+        "ramps": [{"id": ramp_id, **ramp} for ramp_id, ramp in RAMPS.items()],
         "examples": EXAMPLE_REQUESTS,
         "index_count": index_count,
-        "model": LLM_MODEL.split("/")[-1],
+        "model": settings.get("LLM_MODEL").split("/")[-1],
     })
+
+
+def _setup_status() -> dict:
+    key = settings.get("LLM_API_KEY")
+    return {
+        "configured": _ready(),
+        "signed_in": connections.signed_in(),
+        "project": settings.get("EE_PROJECT"),
+        "project_ok": STATE["ee_ok"],
+        "project_problem": STATE["ee_problem"],
+        "model": settings.get("LLM_MODEL"),
+        "has_key": bool(key),
+        "key_hint": settings.key_hint(key) if key else None,
+        "env_file": str(settings.ENV_PATH),
+        "register_url": connections.REGISTER_URL,
+    }
+
+
+def api_setup(request: Request):
+    return JSONResponse(_setup_status())
+
+
+def _save_setup(body: dict) -> tuple[dict, int]:
+    project = str(body.get("project") or "").strip()
+    model = str(body.get("model") or "").strip()
+    saved_key = settings.get("LLM_API_KEY")
+    key = str(body.get("api_key") or "").strip() or saved_key
+
+    errors = {}
+    if not connections.signed_in():
+        errors["signin"] = "Sign in with Google first."
+    if not project:
+        errors["project"] = "Enter your Earth Engine project ID."
+    elif not re.fullmatch(r"[a-z][a-z0-9-]{4,62}", project):
+        errors["project"] = ("A project ID has 6 to 63 lowercase letters, digits and hyphens, "
+                             "like \"my-project-123\". Copy it from the Google Cloud console.")
+    if not model:
+        errors["llm"] = "Choose an AI model."
+    elif "/" not in model:
+        errors["llm"] = "Write the model as provider/model, for example openai/gpt-4o-mini."
+    elif not key:
+        errors["llm"] = "Paste the API key for this AI service."
+
+    if "signin" not in errors and "project" not in errors:
+        problem = connections.connect_earth_engine(project)
+        if problem:
+            errors["project"] = problem
+            previous = settings.get("EE_PROJECT")
+            if STATE["ee_ok"] and previous and previous != project:
+                connections.connect_earth_engine(previous)   # keep working on the old one
+    llm_changed = key != saved_key or model != settings.get("LLM_MODEL") or STATE["llm"] is None
+    if "llm" not in errors and llm_changed:
+        problem = connections.check_llm(key, model)
+        if problem:
+            errors["llm"] = problem
+    if errors:
+        return {"ok": False, "errors": errors}, 400
+
+    settings.save({"EE_PROJECT": project, "LLM_MODEL": model, "LLM_API_KEY": key})
+    STATE.update(ee_ok=True, ee_problem=None, llm=create_llm(key, model))
+    return {"ok": True, "setup": _setup_status()}, 200
+
+
+async def api_save_setup(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "The request body must be JSON."}, status_code=400)
+    if _busy():
+        return JSONResponse({"error": "A map is being made. Change the settings when it has finished."},
+                            status_code=409)
+    payload, status = await run_in_threadpool(_save_setup, body)
+    return JSONResponse(payload, status_code=status)
+
+
+async def api_start_signin(request: Request):
+    try:
+        url = await run_in_threadpool(SIGN_IN.start)
+    except Exception as e:
+        return JSONResponse({"error": f"The Google sign-in could not be started ({e})."}, status_code=500)
+    return JSONResponse({"url": url})
+
+
+def api_signin_status(request: Request):
+    return JSONResponse({"state": SIGN_IN.state, "error": SIGN_IN.error,
+                         "signed_in": SIGN_IN.state == "done" or connections.signed_in()})
 
 
 async def api_region(request: Request):
@@ -327,8 +480,8 @@ async def api_region(request: Request):
 
 
 async def api_create_map(request: Request):
-    if STATE["problems"]:
-        return JSONResponse({"error": " ".join(STATE["problems"])}, status_code=503)
+    if not _ready():
+        return JSONResponse({"error": "Finish the setup first (Settings, top right)."}, status_code=503)
     try:
         body = await request.json()
     except Exception:
@@ -375,6 +528,26 @@ def api_get_map(request: Request):
     return missing or JSONResponse(_job_payload(job))
 
 
+async def api_choose_dataset(request: Request):
+    job, missing = _job_or_404(request)
+    if missing:
+        return missing
+    try:
+        dataset = str((await request.json()).get("dataset") or "").strip()
+    except Exception:
+        return JSONResponse({"error": "The request body must be JSON."}, status_code=400)
+    with JOBS_LOCK:
+        if job.status != "choice":
+            return JSONResponse({"error": "This map is not waiting for a dataset choice."}, status_code=409)
+        if dataset != AUTO_CHOICE and dataset not in {o["id"] for o in job.choice["options"]}:
+            return JSONResponse({"error": "Pick one of the datasets offered."}, status_code=400)
+        job.request["dataset"] = dataset
+        job.waited += time.time() - (job.paused_at or time.time())
+        job.status = "queued"
+    WORKER.submit(_run_job, job)
+    return JSONResponse({"ok": True}, status_code=202)
+
+
 def api_render_original(request: Request):
     job, missing = _job_or_404(request)
     if missing:
@@ -388,6 +561,54 @@ def api_render_original(request: Request):
             res["original"] = WORKER.submit(render_original_map, res["original_job"]).result()
         except Exception as e:
             return JSONResponse({"error": f"The original map could not be rendered ({e})."}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+def _apply_style(res: dict, ramp: str, palette: list[str], vmin: float, vmax: float):
+    """Draw the map with the new colours and make it the map's current figure."""
+    with res["style_lock"]:
+        original = res["style"]
+        if ramp == "original" and vmin == original["min"] and vmax == original["max"]:
+            figure = res["original_figure"]         # exactly as it was made
+        else:
+            figure = restyle_map(res["restyle"], palette, vmin, vmax)
+        res["png_bytes"], res["pdf_bytes"] = figure["png"], figure["pdf"]
+        state = res["style_state"]
+        state.update(ramp=ramp, palette=list(palette), min=vmin, max=vmax, version=state["version"] + 1)
+        # The original (not gap-filled) version takes the new colours when next shown.
+        if res.get("original_job"):
+            job = res["original_job"]
+            vis = {**job["vis_params"], "palette": list(palette), "min": vmin, "max": vmax}
+            res["original_job"] = {**job, "vis_params": vis,
+                                   "render_kwargs": {**job["render_kwargs"], "vis_params_gee": vis}}
+            res.pop("original", None)
+
+
+async def api_style(request: Request):
+    job, missing = _job_or_404(request)
+    if missing:
+        return missing
+    res = job.result if job.status == "done" else None
+    if not res or not res.get("style_state"):
+        return JSONResponse({"error": "This map's colours cannot be changed: only maps drawn with a colour "
+                                      "ramp can be restyled."}, status_code=400)
+    try:
+        body = await request.json()
+        vmin, vmax = float(body["min"]), float(body["max"])
+    except Exception:
+        return JSONResponse({"error": "Give the legend's minimum and maximum as numbers."}, status_code=400)
+    if not (math.isfinite(vmin) and math.isfinite(vmax)) or vmax <= vmin:
+        return JSONResponse({"error": "The legend's maximum must be greater than its minimum."}, status_code=400)
+    ramp = str(body.get("ramp") or "original")
+    palette = res["style"]["palette"] if ramp == "original" else (RAMPS.get(ramp) or {}).get("colors")
+    if not palette:
+        return JSONResponse({"error": "Pick one of the colour ramps offered."}, status_code=400)
+    try:
+        await run_in_threadpool(_apply_style, res, ramp, palette, vmin, vmax)
+    except Exception as e:
+        print(f"Restyling failed: {e}")
+        return JSONResponse({"error": "The map's values could not be fetched from Earth Engine, so its colours "
+                                      "were not changed. Try again in a moment."}, status_code=502)
     return JSONResponse({"ok": True})
 
 
@@ -422,7 +643,7 @@ def api_file(request: Request):
         geotiff = res["geotiff"]
         if "bytes" not in geotiff:
             try:
-                geotiff["bytes"] = fetch_geotiff(geotiff["url"])
+                geotiff["bytes"] = fetch_geotiff(geotiff)
             except Exception as e:
                 return JSONResponse({"error": f"GeoTIFF export failed ({e})."}, status_code=502)
         return send(geotiff["bytes"], "image/tiff", f"{base}.tif")
@@ -431,11 +652,17 @@ def api_file(request: Request):
 
 routes = [
     Route("/api/meta", api_meta),
+    Route("/api/setup", api_setup),
+    Route("/api/setup", api_save_setup, methods=["POST"]),
+    Route("/api/setup/signin", api_start_signin, methods=["POST"]),
+    Route("/api/setup/signin", api_signin_status),
     Route("/api/region", api_region, methods=["POST"]),
     Route("/api/maps", api_create_map, methods=["POST"]),
     Route("/api/maps", api_list_maps, methods=["GET"]),
     Route("/api/maps/{job_id}", api_get_map),
+    Route("/api/maps/{job_id}/dataset", api_choose_dataset, methods=["POST"]),
     Route("/api/maps/{job_id}/original", api_render_original, methods=["POST"]),
+    Route("/api/maps/{job_id}/style", api_style, methods=["POST"]),
     Route("/api/maps/{job_id}/file/{name}", api_file),
 ]
 if FRONTEND_DIR.exists():
@@ -452,8 +679,12 @@ app = Starlette(routes=routes, lifespan=lifespan)
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    port = settings.port()
     if not FRONTEND_DIR.exists():
-        print("Note: frontend/dist not found - build the interface with `npm run build` in frontend/.")
-    print(f"Gee-Luma: http://localhost:{port}")
+        raise SystemExit("The interface is missing (frontend/dist). Build it with `npm install` and "
+                         "`npm run build` in the frontend folder.")
+    url = f"http://localhost:{port}"
+    print(f"Gee-Luma is running at {url}  (press Ctrl+C to stop)")
+    if "--no-browser" not in sys.argv:
+        threading.Timer(1.5, webbrowser.open, args=(url,)).start()
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

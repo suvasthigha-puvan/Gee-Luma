@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { CalendarDays, CloudOff, Download, FileImage, FileSpreadsheet, FileText, Grid3x3, Layers, Loader2, Satellite } from "lucide-react";
+import { CalendarDays, CloudOff, Download, FileImage, FileSpreadsheet, FileText, Grid3x3, LayoutGrid, Layers, Loader2, Satellite } from "lucide-react";
 import { api } from "../api";
-import type { Job, MapResult } from "../types";
+import type { ColorRamp, Job, MapResult } from "../types";
 import { MapViewer } from "./MapViewer";
+import { StyleControls } from "./StyleControls";
 import { StatsPanel } from "./StatsPanel";
 import { Details } from "./Details";
 
@@ -10,33 +11,55 @@ interface Props {
   job: Job;
   result: MapResult;
   onJobChange: (job: Job) => void;
+  /** Colour ramps the map can be restyled with. */
+  ramps: ColorRamp[];
 }
 
 type Version = "filled" | "original";
 
-export function ResultView({ job, result, onJobChange }: Props) {
+export function ResultView({ job, result, onJobChange, ramps }: Props) {
   const [version, setVersion] = useState<Version>("filled");
   const [renderingOriginal, setRenderingOriginal] = useState(false);
+  const [restyling, setRestyling] = useState(false);
   const [preparingTiff, setPreparingTiff] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const fill = result.gap_fill;
   const showingOriginal = version === "original" && result.original_rendered;
 
+  const renderOriginal = async () => {
+    setRenderingOriginal(true);
+    try {
+      await api.renderOriginal(job.id);
+      onJobChange(await api.job(job.id));
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : "The original map could not be rendered.");
+      setVersion("filled");
+    } finally {
+      setRenderingOriginal(false);
+    }
+  };
+
   const pickVersion = async (next: Version) => {
     setActionError(null);
     setVersion(next);
     if (next === "original" && !result.original_rendered && !renderingOriginal) {
-      setRenderingOriginal(true);
-      try {
-        await api.renderOriginal(job.id);
-        onJobChange(await api.job(job.id));
-      } catch (e) {
-        setActionError(e instanceof Error ? e.message : "The original map could not be rendered.");
-        setVersion("filled");
-      } finally {
-        setRenderingOriginal(false);
-      }
+      await renderOriginal();
+    }
+  };
+
+  const applyStyle = async (ramp: string, min: number, max: number) => {
+    setActionError(null);
+    setRestyling(true);
+    try {
+      await api.setStyle(job.id, { ramp, min, max });
+      onJobChange(await api.job(job.id));
+      // The original (not gap-filled) map is drawn again in the new colours.
+      if (version === "original") await renderOriginal();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : "The colours could not be changed.");
+    } finally {
+      setRestyling(false);
     }
   };
 
@@ -54,6 +77,7 @@ export function ResultView({ job, result, onJobChange }: Props) {
 
   const imageName = showingOriginal ? "original.png" : "map.png";
   const pdfName = showingOriginal ? "original.pdf" : "map.pdf";
+  const styleVersion = result.style?.version ?? 0;
 
   return (
     <div className="result">
@@ -64,6 +88,11 @@ export function ResultView({ job, result, onJobChange }: Props) {
           {result.period && (
             <span className="chip">
               <CalendarDays size={13} /> {result.period}
+            </span>
+          )}
+          {result.series && (
+            <span className="chip">
+              <LayoutGrid size={13} /> {result.series.maps.length} maps
             </span>
           )}
           <span className="chip">
@@ -103,10 +132,10 @@ export function ResultView({ job, result, onJobChange }: Props) {
         )}
 
         <div className="downloads">
-          <a className="tool" href={api.fileUrl(job.id, imageName, true)}>
+          <a className="tool" href={api.fileUrl(job.id, imageName, true, styleVersion)}>
             <FileImage size={15} /> PNG
           </a>
-          <a className="tool" href={api.fileUrl(job.id, pdfName, true)}>
+          <a className="tool" href={api.fileUrl(job.id, pdfName, true, styleVersion)}>
             <FileText size={15} /> PDF
           </a>
           {result.has_csv && (
@@ -123,6 +152,10 @@ export function ResultView({ job, result, onJobChange }: Props) {
         </div>
       </div>
 
+      {result.style && ramps.length > 0 && (
+        <StyleControls style={result.style} ramps={ramps} busy={restyling || renderingOriginal} onApply={applyStyle} />
+      )}
+
       {actionError && (
         <div className="banner banner-error" role="alert">
           {actionError}
@@ -130,9 +163,12 @@ export function ResultView({ job, result, onJobChange }: Props) {
       )}
 
       <MapViewer
-        src={api.fileUrl(job.id, imageName)}
+        src={api.fileUrl(job.id, imageName, false, styleVersion)}
+        viewKey={`${job.id}/${imageName}`}
         alt={`${result.title}${showingOriginal ? " (original, no gap filling)" : ""}`}
-        busyLabel={renderingOriginal ? "Rendering the original map…" : null}
+        busyLabel={
+          restyling ? "Applying the new colours…" : renderingOriginal ? "Rendering the original map…" : null
+        }
       />
 
       {result.geotiff && (
@@ -142,7 +178,8 @@ export function ResultView({ job, result, onJobChange }: Props) {
           {result.geotiff.resampled
             ? ` (resampled from ${result.geotiff.native_scale_m.toLocaleString("en-US")} m to fit Earth Engine's download limit)`
             : ""}
-          .{fill ? " Statistics and GeoTIFF describe the gap-filled map." : ""}
+          .{result.series ? " It has one band per map." : ""}
+          {fill ? " Statistics and GeoTIFF describe the gap-filled map." : ""}
         </p>
       )}
 

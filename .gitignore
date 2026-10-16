@@ -34,7 +34,10 @@ Thumbs.db
 
 # Web interface (React)
 node_modules/
-frontend/dist/
+!frontend/dist/
 !frontend/package.json
 !frontend/package-lock.json
 !frontend/tsconfig.json
+
+# selenium-mcp server log
+mcp-server.log

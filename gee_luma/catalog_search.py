@@ -90,8 +90,9 @@ _DATASET_NAMES = (
 
 def recommended_for(text: str) -> list[tuple[str, str]]:
     """(id, title) of the standard datasets for every theme mentioned in `text`."""
-    lower = text.lower()
-    named = [n for n in _DATASET_NAMES if re.search(r"\b" + re.escape(n) + r"\b", lower)]
+    # "ET" in capitals is the usual abbreviation; in lower case it is just a word.
+    lower = re.sub(r"\bET\b", "evapotranspiration", text).lower()
+    named =[n for n in _DATASET_NAMES if re.search(r"\b" + re.escape(n) + r"\b", lower)]
     matches = []
     for phrases, rec_id, rec_title in RECOMMENDED_DATASETS:
         # Whole words only: "rain" must not match "rainforest".

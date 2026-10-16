@@ -10,10 +10,20 @@ export interface ExampleRequest {
   text: string;
 }
 
+/** A colour ramp a finished map can be restyled with. */
+export interface ColorRamp {
+  id: string;
+  name: string;
+  /** "Gee-Luma" (the app's own palettes) or "QGIS" (QGIS's default ramps). */
+  group: string;
+  colors: string[];
+}
+
 export interface Meta {
   ready: boolean;
   problems: string[];
   palettes: Palette[];
+  ramps: ColorRamp[];
   examples: ExampleRequest[];
   index_count: number;
   model: string;
@@ -61,7 +71,39 @@ export interface CategoricalStats {
   mapped_km2: number | null;
 }
 
-export type Stats = ContinuousStats | CategoricalStats;
+/** One map of a multi-map figure. */
+export interface SeriesRow {
+  label: string;
+  mean: number | null;
+  min: number | null;
+  max: number | null;
+  std: number | null;
+  coverage_percent: number | null;
+}
+
+export interface SeriesStats {
+  kind: "series";
+  rows: SeriesRow[];
+  area_km2: number | null;
+}
+
+export interface SeriesClassRow {
+  value: number;
+  class: string;
+  color?: string;
+  /** One entry per map, in the order of `panels`. */
+  area_km2: number[];
+  percent: number[];
+}
+
+export interface SeriesClassStats {
+  kind: "series_categorical";
+  panels: string[];
+  rows: SeriesClassRow[];
+  area_km2: number | null;
+}
+
+export type Stats = ContinuousStats | CategoricalStats | SeriesStats | SeriesClassStats;
 
 export interface GapFill {
   original_percent: number;
@@ -69,6 +111,17 @@ export interface GapFill {
   days: number;
   window_start: string;
   window_end: string;
+}
+
+export interface MapStyle {
+  /** "original" (the colours the map was made with) or the id of a ColorRamp. */
+  ramp: string;
+  palette: string[];
+  min: number;
+  max: number;
+  /** Goes up with every change, so the browser fetches the redrawn map. */
+  version: number;
+  original: { palette: string[]; min: number; max: number };
 }
 
 export interface MapResult {
@@ -94,7 +147,11 @@ export interface MapResult {
     projection: string;
   };
   gap_fill: GapFill | null;
+  /** Set when the figure holds several maps (monthly, annual, ...). */
+  series: { kind: string; grid: string | null; maps: { label: string; images: number }[] } | null;
   original_rendered: boolean;
+  /** Colour ramp and legend range; null for maps whose colours cannot be changed (colour images, classes). */
+  style: MapStyle | null;
   stats: Stats | null;
   has_csv: boolean;
   geotiff: { scale_m: number; native_scale_m: number; resampled: boolean } | null;
@@ -109,7 +166,28 @@ export interface MapResult {
   agent: Record<string, unknown> | null;
 }
 
-export type JobStatus = "queued" | "running" | "done" | "error";
+/** One of the datasets a request could mean ("NDVI using MODIS" fits several). */
+export interface DatasetOption {
+  id: string;
+  title: string;
+  provider: string;
+  /** What sets this dataset apart from the other options. */
+  note: string;
+  resolution: string;
+  cadence: string;
+  coverage: string;
+  /** The dataset Gee-Luma uses for this theme when nobody chooses. */
+  standard?: boolean;
+}
+
+export interface DatasetChoice {
+  /** The dataset name as the request wrote it, e.g. "MODIS"; empty when it names none. */
+  named: string;
+  options: DatasetOption[];
+}
+
+/** "choice": the job waits for the person to pick a dataset before it processes anything. */
+export type JobStatus = "queued" | "running" | "choice" | "done" | "error";
 
 export interface JobSummary {
   id: string;
@@ -117,6 +195,8 @@ export interface JobSummary {
   prompt: string;
   created: number;
   elapsed: number;
+  /** Seconds the job spent waiting for a dataset choice (not counted in `elapsed`). */
+  waited?: number;
   error: string | null;
   title: string | null;
   region: string | null;
@@ -126,6 +206,23 @@ export interface Job extends JobSummary {
   steps: Step[];
   notes: Note[];
   result: MapResult | null;
+  choice?: DatasetChoice | null;
+  /** A usage limit stopped the job: Earth Engine's (for this project) or the AI service's. */
+  limit?: { kind: "earthengine" | "llm"; project: string } | null;
+}
+
+/** The settings in the .env file, and whether they work. */
+export interface Setup {
+  configured: boolean;
+  signed_in: boolean;
+  project: string;
+  project_ok: boolean;
+  project_problem: string | null;
+  model: string;
+  has_key: boolean;
+  key_hint: string | null;
+  env_file: string;
+  register_url: string;
 }
 
 export interface RegionUpload {
