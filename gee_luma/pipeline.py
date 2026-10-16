@@ -116,6 +116,7 @@ from gee_luma.class_legend import (
     is_class_candidate, distinct_values, snap_to_values, shorten_legend, MAX_DETECTED_CLASSES,
 )
 from gee_luma.exports import geotiff_download, fetch_geotiff
+from gee_luma.restyle import prepare_restyle
 
 # Ways to combine the images of a period into one map.
 TEMPORAL_REDUCERS = {
@@ -1567,6 +1568,16 @@ RGB Sentinel-2:
             }
         status_render.update(label="Cartographic layout rendered", state="complete")
 
+        # A continuous map can be given another colour ramp and legend range
+        # later: its values are prepared for download on the picture's grid.
+        restyle_job = None
+        if not is_rgb and not is_categorical and vis_params_gee.get("palette"):
+            restyle_job = prepare_restyle(
+                [p["image"] for p in panels] if panels else [final_img], value_band, extent, projection["crs"],
+                panel_pils[0].size if panels else map_pil.size, render_kwargs,
+                panels=[{"label": p["label"], "note": p.get("note")} for p in panels] if panels else None,
+                layout=layout if panels else None)
+
         # GeoTIFF of the data itself: real values (or the dataset's class
         # codes), in the map projection. Only the link is prepared here; the
         # file is downloaded when the user asks for it.
@@ -1612,6 +1623,10 @@ RGB Sentinel-2:
             "agent":      params,
             "is_rgb":     is_rgb,
             "original_job": original_job,
+            "restyle":    restyle_job,
+            # The style the map was made with: colour ramp and legend range.
+            "style":      ({"palette": list(vis_params_gee["palette"]), "min": float(vis_params_gee.get("min", 0)),
+                            "max": float(vis_params_gee.get("max", 1))} if restyle_job else None),
             "map_label":  ascii_label(map_label),
             "region":     ascii_label(region_name),
             "n_images":   n_images,

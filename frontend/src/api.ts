@@ -57,8 +57,14 @@ export const api = {
 
   renderOriginal: (id: string) => call<{ ok: true }>(`/api/maps/${id}/original`, { method: "POST" }),
 
-  fileUrl: (id: string, name: string, download = false) =>
-    `/api/maps/${id}/file/${name}${download ? "?download=1" : ""}`,
+  setStyle: (id: string, style: { ramp: string; min: number; max: number }) =>
+    call<{ ok: true }>(`/api/maps/${id}/style`, postJson(style)),
+
+  /** `version` changes when the map is redrawn (new colours), so a cached copy is not reused. */
+  fileUrl: (id: string, name: string, download = false, version = 0) => {
+    const query = [download ? "download=1" : "", version ? `v=${version}` : ""].filter(Boolean).join("&");
+    return `/api/maps/${id}/file/${name}${query ? `?${query}` : ""}`;
+  },
 
   /** Fetch a file that the server prepares on request (the GeoTIFF) and save it. */
   async saveFile(id: string, name: string, fileName: string) {

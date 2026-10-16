@@ -21,6 +21,7 @@ Endpoints
     GET  /api/maps/{id}                  job progress and result
     POST /api/maps/{id}/dataset          continue a job that is waiting for a dataset choice
     POST /api/maps/{id}/original         render the original (not gap-filled) map
+    POST /api/maps/{id}/style            change a finished map's colour ramp and legend range
     GET  /api/maps/{id}/file/{name}      map.png, map.pdf, stats.csv, data.tif,
                                          original.png, original.pdf
 
@@ -30,6 +31,7 @@ Results are kept in memory only; they are gone when the server stops.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -42,6 +44,7 @@ from pathlib import Path
 import ee
 import uvicorn
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
@@ -51,12 +54,21 @@ from gee_luma.pipeline import (
     run_pipeline, render_original_map, create_llm, missing_settings_message,
     PALETTE_PRESETS, EE_PROJECT, LLM_MODEL, SPYNDEX_AVAILABLE,
 )
+from gee_luma.color_ramps import QGIS_RAMPS
 from gee_luma.dataset_options import AUTO_CHOICE
 from gee_luma.exports import fetch_geotiff
+from gee_luma.restyle import fetch_values, restyle_map
 from gee_luma.geojson_helpers import _ensure_wgs84, get_geojson_bounds, get_geojson_label
 
 FRONTEND_DIR = Path(__file__).with_name("frontend") / "dist"
 MAX_JOBS_KEPT = 12
+
+# Colour ramps a finished map can be restyled with: Gee-Luma's own palettes
+# and the gradient ramps of QGIS's default style.
+RAMPS = {f"app:{name}": {"name": name, "group": "Gee-Luma", "colors": colors}
+         for name, colors in PALETTE_PRESETS.items() if colors}
+RAMPS.update({f"qgis:{name}": {"name": name, "group": "QGIS", "colors": colors}
+              for name, colors in QGIS_RAMPS.items()})
 
 EXAMPLE_REQUESTS = [
     {"label": "Vegetation", "text": "NDVI map for Sri Lanka using Sentinel-2, last 3 months"},
@@ -234,6 +246,14 @@ def _run_job(job: Job):
         return
 
     if job.result:
+        res = job.result
+        if res.get("restyle"):
+            # The style it was made with, kept so it can be restored exactly.
+            res["style_state"] = {"ramp": "original", **res["style"], "version": 0}
+            res["original_figure"] = {"png": res["png_bytes"], "pdf": res["pdf_bytes"]}
+            res["style_lock"] = threading.Lock()
+            # Fetch the values now, so the first change of colours is quick.
+            threading.Thread(target=_prefetch_values, args=(res["restyle"],), daemon=True).start()
         job.status = "done"
         job.ui.close_open_steps("complete")
     else:
@@ -249,6 +269,13 @@ def _run_job(job: Job):
                           key=lambda j: j.created)
         for old in finished[:-MAX_JOBS_KEPT]:
             JOBS.pop(old.id, None)
+
+
+def _prefetch_values(restyle: dict):
+    try:
+        fetch_values(restyle)
+    except Exception as e:      # tried again when the person changes the colours
+        print(f"Map values for restyling not fetched yet: {e}")
 
 
 def _json_safe(value):
@@ -290,6 +317,9 @@ def _result_payload(job: Job) -> dict | None:
         "series": ({"kind": res["series"], "grid": res.get("grid"), "maps": res.get("panels") or []}
                    if res.get("series") else None),
         "original_rendered": bool(res.get("original")),
+        # Colour ramp and legend range, for maps whose colours can be changed.
+        "style": ({**{k: res["style_state"][k] for k in ("ramp", "palette", "min", "max", "version")},
+                   "original": res["style"]} if res.get("style_state") else None),
         "stats": stats,
         "has_csv": bool(res.get("stats_csv")),
         "geotiff": ({k: geotiff[k] for k in ("scale_m", "native_scale_m", "resampled")} if geotiff else None),
@@ -331,6 +361,7 @@ def api_meta(request: Request):
         "ready": not STATE["problems"],
         "problems": STATE["problems"],
         "palettes": [{"name": name, "colors": colors} for name, colors in PALETTE_PRESETS.items()],
+        "ramps": [{"id": ramp_id, **ramp} for ramp_id, ramp in RAMPS.items()],
         "examples": EXAMPLE_REQUESTS,
         "index_count": index_count,
         "model": LLM_MODEL.split("/")[-1],
@@ -436,6 +467,54 @@ def api_render_original(request: Request):
     return JSONResponse({"ok": True})
 
 
+def _apply_style(res: dict, ramp: str, palette: list[str], vmin: float, vmax: float):
+    """Draw the map with the new colours and make it the map's current figure."""
+    with res["style_lock"]:
+        original = res["style"]
+        if ramp == "original" and vmin == original["min"] and vmax == original["max"]:
+            figure = res["original_figure"]         # exactly as it was made
+        else:
+            figure = restyle_map(res["restyle"], palette, vmin, vmax)
+        res["png_bytes"], res["pdf_bytes"] = figure["png"], figure["pdf"]
+        state = res["style_state"]
+        state.update(ramp=ramp, palette=list(palette), min=vmin, max=vmax, version=state["version"] + 1)
+        # The original (not gap-filled) version takes the new colours when next shown.
+        if res.get("original_job"):
+            job = res["original_job"]
+            vis = {**job["vis_params"], "palette": list(palette), "min": vmin, "max": vmax}
+            res["original_job"] = {**job, "vis_params": vis,
+                                   "render_kwargs": {**job["render_kwargs"], "vis_params_gee": vis}}
+            res.pop("original", None)
+
+
+async def api_style(request: Request):
+    job, missing = _job_or_404(request)
+    if missing:
+        return missing
+    res = job.result if job.status == "done" else None
+    if not res or not res.get("style_state"):
+        return JSONResponse({"error": "This map's colours cannot be changed: only maps drawn with a colour "
+                                      "ramp can be restyled."}, status_code=400)
+    try:
+        body = await request.json()
+        vmin, vmax = float(body["min"]), float(body["max"])
+    except Exception:
+        return JSONResponse({"error": "Give the legend's minimum and maximum as numbers."}, status_code=400)
+    if not (math.isfinite(vmin) and math.isfinite(vmax)) or vmax <= vmin:
+        return JSONResponse({"error": "The legend's maximum must be greater than its minimum."}, status_code=400)
+    ramp = str(body.get("ramp") or "original")
+    palette = res["style"]["palette"] if ramp == "original" else (RAMPS.get(ramp) or {}).get("colors")
+    if not palette:
+        return JSONResponse({"error": "Pick one of the colour ramps offered."}, status_code=400)
+    try:
+        await run_in_threadpool(_apply_style, res, ramp, palette, vmin, vmax)
+    except Exception as e:
+        print(f"Restyling failed: {e}")
+        return JSONResponse({"error": "The map's values could not be fetched from Earth Engine, so its colours "
+                                      "were not changed. Try again in a moment."}, status_code=502)
+    return JSONResponse({"ok": True})
+
+
 def api_file(request: Request):
     job, missing = _job_or_404(request)
     if missing:
@@ -482,6 +561,7 @@ routes = [
     Route("/api/maps/{job_id}", api_get_map),
     Route("/api/maps/{job_id}/dataset", api_choose_dataset, methods=["POST"]),
     Route("/api/maps/{job_id}/original", api_render_original, methods=["POST"]),
+    Route("/api/maps/{job_id}/style", api_style, methods=["POST"]),
     Route("/api/maps/{job_id}/file/{name}", api_file),
 ]
 if FRONTEND_DIR.exists():

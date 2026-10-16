@@ -10,8 +10,10 @@ Public API:
   render_cartographic_figure(...)  -> {"png": bytes, "pdf": bytes}
 """
 
+import functools
 import io
 import textwrap
+import threading
 
 import matplotlib
 matplotlib.use("Agg")
@@ -31,6 +33,18 @@ from gee_luma.utils import ascii_label
 from gee_luma.boundary_agent import draw_geojson_outline
 
 matplotlib.rcParams.update({"font.family": "DejaVu Sans"})
+
+# pyplot keeps global state, so figures are drawn one at a time: a map being
+# restyled may be drawn while another one is being generated.
+_DRAWING = threading.Lock()
+
+
+def _one_at_a_time(render):
+    @functools.wraps(render)
+    def locked(*args, **kwargs):
+        with _DRAWING:
+            return render(*args, **kwargs)
+    return locked
 
 _PANEL_BG  = "#ffffff"
 _TEXT_DARK = "#0d1b2a"
@@ -253,6 +267,7 @@ def _draw_context_lines(map_ax, geo_bounds):
 
 # ====================== MAIN RENDERER ======================
 
+@_one_at_a_time
 def render_cartographic_figure(
     map_pil_image,
     extent,
@@ -529,6 +544,7 @@ def _class_legend_grid(n_classes: int, width: float) -> tuple[int, int]:
     return n_cols, int(np.ceil(n_classes / n_cols))
 
 
+@_one_at_a_time
 def render_composite_figure(
     panels,
     layout,

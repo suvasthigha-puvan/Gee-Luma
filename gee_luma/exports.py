@@ -69,6 +69,50 @@ def _spans(length: int, tile: int) -> list[tuple[int, int]]:
     return [(edges[i], edges[i + 1] - edges[i]) for i in range(count)]
 
 
+def array_tiles(img: ee.Image, crs: str, origin, pixel, width: int, height: int, n_bands: int,
+                tile_values: int | None = None) -> list[tuple]:
+    """
+    NPY download URLs covering a width x height pixel grid of `img`, as
+    [(x px, y px, width px, height px, url), ...].
+
+    origin: (x, y) of the grid's top-left corner in `crs`
+    pixel:  (pixel width, pixel height) in `crs` units
+    URLs are created one at a time (the Earth Engine client is not
+    thread-safe); fetch_array() downloads them in parallel.
+    """
+    tile_px = max(int(math.sqrt((tile_values or _TILE_VALUES) / max(n_bands, 1))), 64)
+    (x_origin, y_origin), (px_w, px_h) = origin, pixel
+    tiles = []
+    for y0, h in _spans(height, tile_px):
+        for x0, w in _spans(width, tile_px):
+            url = img.getDownloadURL({
+                "crs": crs, "format": "NPY", "dimensions": f"{w}x{h}",
+                "crs_transform": [px_w, 0, x_origin + x0 * px_w, 0, -px_h, y_origin - y0 * px_h],
+            })
+            tiles.append((x0, y0, w, h, url))
+    return tiles
+
+
+def fetch_array(tiles: list[tuple], width: int, height: int) -> tuple[np.ndarray, list[str]]:
+    """
+    Download the tiles from array_tiles() and join them: (bands x rows x
+    columns array, band names). Masked pixels are -inf for floating-point
+    data and 0 for integers. Raises RuntimeError with Earth Engine's message.
+    """
+    with ThreadPoolExecutor(max_workers=_MAX_PARALLEL) as pool:
+        parts = list(pool.map(lambda tile: _get(tile[4]), tiles))
+    data, names = None, None
+    for (x0, y0, w, h, _), raw in zip(tiles, parts):
+        part = np.load(io.BytesIO(raw), allow_pickle=False)
+        if data is None:
+            names = list(part.dtype.names)
+            dtype = np.result_type(*[part.dtype[n] for n in names])
+            data = np.zeros((len(names), height, width), dtype=dtype)
+        for b, name in enumerate(names):
+            data[b, y0:y0 + h, x0:x0 + w] = part[name][:h, :w]
+    return data, names
+
+
 def geotiff_download(img: ee.Image, extent, projection: dict, n_bands: int,
                      native_scale_m: float | None, lat_mid: float = 0.0) -> dict | None:
     """
@@ -95,20 +139,10 @@ def geotiff_download(img: ee.Image, extent, projection: dict, n_bands: int,
     pixel = scale if projection["metric"] else scale / _METRES_PER_DEGREE
     width = max(math.ceil((xmax - xmin) / pixel - 1e-6), 1)
     height = max(math.ceil((ymax - ymin) / pixel - 1e-6), 1)
-    tile_px = max(int(math.sqrt(_TILE_VALUES / max(n_bands, 1))), 64)
     crs = projection["crs"]
 
     try:
-        # URLs are created one at a time (the Earth Engine client is not
-        # thread-safe); only the downloads run in parallel.
-        tiles = []
-        for y0, h in _spans(height, tile_px):
-            for x0, w in _spans(width, tile_px):
-                url = img.getDownloadURL({
-                    "crs": crs, "format": "NPY", "dimensions": f"{w}x{h}",
-                    "crs_transform": [pixel, 0, xmin + x0 * pixel, 0, -pixel, ymax - y0 * pixel],
-                })
-                tiles.append((x0, y0, w, h, url))
+        tiles = array_tiles(img, crs, (xmin, ymax), (pixel, pixel), width, height, n_bands)
         # A one-pixel GeoTIFF in the same projection, for its geo keys.
         keys_url = ee.Image.constant(0).toFloat().getDownloadURL({
             "crs": crs, "format": "GEO_TIFF", "dimensions": "1x1",
@@ -146,21 +180,10 @@ def fetch_geotiff(geotiff: dict) -> bytes:
     Download a prepared GeoTIFF (the dict from geotiff_download) and return
     the file. Raises RuntimeError with Earth Engine's message on failure.
     """
-    tiles = geotiff["tiles"]
-    with ThreadPoolExecutor(max_workers=_MAX_PARALLEL) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         keys_job = pool.submit(_get, geotiff["keys_url"])
-        parts = list(pool.map(lambda tile: _get(tile[4]), tiles))
+        data, names = fetch_array(geotiff["tiles"], geotiff["width"], geotiff["height"])
         keys_tif = keys_job.result()
-
-    data, names = None, None
-    for (x0, y0, w, h, _), raw in zip(tiles, parts):
-        part = np.load(io.BytesIO(raw), allow_pickle=False)
-        if data is None:
-            names = list(part.dtype.names)
-            dtype = np.result_type(*[part.dtype[n] for n in names])
-            data = np.zeros((len(names), geotiff["height"], geotiff["width"]), dtype=dtype)
-        for b, name in enumerate(names):
-            data[b, y0:y0 + h, x0:x0 + w] = part[name][:h, :w]
 
     tags = Image.open(io.BytesIO(keys_tif)).tag_v2
     geo_keys = {tag: tags[tag] for tag in _GEO_KEY_TAGS if tag in tags}

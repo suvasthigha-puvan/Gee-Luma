@@ -1350,6 +1350,76 @@ kbd {
   color: var(--accent);
 }
 
+/* Colour ramp and legend range of a finished map */
+.style-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 12px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+}
+
+.style-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.style-field label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.style-field label svg {
+  color: var(--accent);
+}
+
+.style-field-ramp {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.style-ramp {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ramp-swatch {
+  flex: none;
+  width: 64px;
+  height: 18px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.style-input {
+  height: 36px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.style-number {
+  width: 116px;
+}
+
+.style-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.style-error {
+  flex-basis: 100%;
+}
+
 .viewer {
   position: relative;
 }

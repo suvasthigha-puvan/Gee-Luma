@@ -6,22 +6,45 @@ interface Props {
   alt: string;
   /** Shown over the map while something is being prepared (e.g. the original render). */
   busyLabel?: string | null;
+  /**
+   * Which picture this is. A new key starts fitted to the frame; a new `src`
+   * with the same key (the same map in new colours) keeps the zoom and is
+   * swapped in once it has loaded. Defaults to `src`.
+   */
+  viewKey?: string;
 }
 
 const MIN_SCALE = 1;
 const MAX_SCALE = 8;
 
 /** The map image with wheel/pinch-free zoom, drag to pan and a fit button. */
-export function MapViewer({ src, alt, busyLabel }: Props) {
+export function MapViewer({ src, alt, busyLabel, viewKey }: Props) {
   const frame = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ scale: 1, x: 0, y: 0 });
   const [loaded, setLoaded] = useState(false);
+  const [shown, setShown] = useState(src);
   const drag = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
+  const key = viewKey ?? src;
 
-  // A new image starts fitted to the frame.
+  // A new picture starts fitted to the frame.
   useEffect(() => {
     setView({ scale: 1, x: 0, y: 0 });
     setLoaded(false);
+    setShown(src);
+  }, [key]);
+
+  // The same picture redrawn: keep showing the old one until the new one has loaded.
+  useEffect(() => {
+    if (src === shown) return;
+    let cancelled = false;
+    const next = new Image();
+    next.onload = next.onerror = () => {
+      if (!cancelled) setShown(src);
+    };
+    next.src = src;
+    return () => {
+      cancelled = true;
+    };
   }, [src]);
 
   const clamp = useCallback((scale: number, x: number, y: number) => {
@@ -90,7 +113,7 @@ export function MapViewer({ src, alt, busyLabel }: Props) {
           </div>
         )}
         <img
-          src={src}
+          src={shown}
           alt={alt}
           draggable={false}
           onLoad={() => setLoaded(true)}

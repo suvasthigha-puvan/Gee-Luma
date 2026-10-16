@@ -243,7 +243,7 @@ export default function App() {
           )}
           {job && job.status === "error" && <Failure job={job} onRetry={generate} canRetry={!!prompt.trim()} />}
           {job && job.status === "done" && job.result && (
-            <ResultView key={job.id} job={job} result={job.result} onJobChange={setJob} />
+            <ResultView key={job.id} job={job} result={job.result} onJobChange={setJob} ramps={meta?.ramps ?? []} />
           )}
         </main>
       </div>

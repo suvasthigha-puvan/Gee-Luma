@@ -10,10 +10,20 @@ export interface ExampleRequest {
   text: string;
 }
 
+/** A colour ramp a finished map can be restyled with. */
+export interface ColorRamp {
+  id: string;
+  name: string;
+  /** "Gee-Luma" (the app's own palettes) or "QGIS" (QGIS's default ramps). */
+  group: string;
+  colors: string[];
+}
+
 export interface Meta {
   ready: boolean;
   problems: string[];
   palettes: Palette[];
+  ramps: ColorRamp[];
   examples: ExampleRequest[];
   index_count: number;
   model: string;
@@ -103,6 +113,17 @@ export interface GapFill {
   window_end: string;
 }
 
+export interface MapStyle {
+  /** "original" (the colours the map was made with) or the id of a ColorRamp. */
+  ramp: string;
+  palette: string[];
+  min: number;
+  max: number;
+  /** Goes up with every change, so the browser fetches the redrawn map. */
+  version: number;
+  original: { palette: string[]; min: number; max: number };
+}
+
 export interface MapResult {
   title: string;
   region: string;
@@ -129,6 +150,8 @@ export interface MapResult {
   /** Set when the figure holds several maps (monthly, annual, ...). */
   series: { kind: string; grid: string | null; maps: { label: string; images: number }[] } | null;
   original_rendered: boolean;
+  /** Colour ramp and legend range; null for maps whose colours cannot be changed (colour images, classes). */
+  style: MapStyle | null;
   stats: Stats | null;
   has_csv: boolean;
   geotiff: { scale_m: number; native_scale_m: number; resampled: boolean } | null;
