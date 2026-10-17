@@ -169,4 +169,11 @@ Vector (table) datasets are not supported yet.
 
 ## License
 
-MIT
+Gee-Luma is released under the [MIT License](LICENSE).
+
+Copyright (c) 2026 Suvasthigha Puvan.
+
+The maps you make use data from Google Earth Engine. Each dataset keeps its own licence and
+terms of use, set by its provider, and Earth Engine itself has its own
+[terms of service](https://earthengine.google.com/terms/). Check them before you publish or
+share maps made with Gee-Luma.
